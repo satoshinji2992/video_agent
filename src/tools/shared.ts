@@ -1,7 +1,7 @@
 // Shared pieces of the studio tools: the session context, result helpers, shot bookkeeping and contact sheets.
 import { existsSync } from 'node:fs';
 import { mkdir, readFile, rm, writeFile } from 'node:fs/promises';
-import { safeFetch, type FootageCandidate } from '../media/footage.ts';
+import { HEADERS as FOOTAGE_HEADERS, safeFetch, type FootageCandidate } from '../media/footage.ts';
 import { type FrameIssue } from '../media/framecheck.ts';
 import { CJK_FONT_FILE, ffmpeg, posterFrame } from '../core/ffmpeg.ts';
 import { type ProjectStore, type Shot } from '../media/project.ts';
@@ -87,7 +87,7 @@ export async function attachClip(ctx: Ctx, s: Shot, inputHash: string) {
  * download or decode are left grey; null if none could be fetched.
  */
 /** `get` fetches a thumbnail (footage hosts by default; models pass their own allowlisted fetch). */
-export async function footageSheet(found: Array<Pick<FootageCandidate, 'thumb'> & { kind?: string }>, out: string, get = (url: string) => safeFetch(url, { signal: AbortSignal.timeout(15_000), headers: { 'User-Agent': 'video-agent-demo/0.1 (footage search)' } })): Promise<string | null> {
+export async function footageSheet(found: Array<Pick<FootageCandidate, 'thumb'> & { kind?: string }>, out: string, get = (url: string) => safeFetch(url, { signal: AbortSignal.timeout(15_000), headers: FOOTAGE_HEADERS })): Promise<string | null> {
   if (existsSync(out)) return out;
   const dir = `${out}.parts`;
   await mkdir(dir, { recursive: true });

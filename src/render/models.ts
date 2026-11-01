@@ -26,6 +26,7 @@ import { inflateRaw } from 'node:zlib';
 import type { Document, Node as GNode, Primitive, Scene } from '@gltf-transform/core';
 import type { InstancedMesh } from '@gltf-transform/extensions';
 import { config } from '../core/config.ts';
+import { Refused, USER_AGENT, withRetry } from '../core/http.ts';
 import { recordManifest, type ManifestEntry } from '../media/footage.ts';
 import { createLimiter } from '../core/limiter.ts';
 
@@ -103,8 +104,9 @@ export interface FetchedModel {
   entry: ModelManifestEntry;
 }
 
-const UA = 'video_agent';
-const HEADERS = { 'User-Agent': UA };
+// Starts with 'video_agent', as Poly Haven asks; Wikimedia-hosted files also want the contact URL in it.
+const HEADERS = { 'User-Agent': USER_AGENT };
+const REFUSED_HINT = '可以换另一个模型库，或者过一会儿再试。';
 const MB = 1024 * 1024;
 const SEARCH_TIMEOUT = 20_000;
 const PAGE_CAP = 4 * MB;
@@ -186,12 +188,13 @@ async function readCapped(res: Response, cap: number): Promise<Buffer> {
 async function request(url: string, ms: number, who: string, cap: number): Promise<Buffer> {
   let res: Response;
   try {
-    res = await modelFetch(url, { signal: AbortSignal.timeout(ms) });
+    const signal = AbortSignal.timeout(ms);
+    res = await withRetry(who, () => modelFetch(url, { signal }));
   } catch (e) {
     if (e instanceof Error && e.message === OFF_LIST) throw e;
+    if (e instanceof Refused) throw new Error(`${e.message}${REFUSED_HINT}`);
     throw new Error(isTimeout(e) ? `${who}响应超时` : `${who}连接失败`);
   }
-  if (res.status === 429) { await res.body?.cancel().catch(() => {}); throw new Error(`${who}请求太频繁，稍后再试`); }
   if (!res.ok) { await res.body?.cancel().catch(() => {}); throw new Error(`${who}返回错误 ${res.status}`); }
   try {
     return await readCapped(res, cap);
@@ -221,9 +224,10 @@ async function download(url: string, dest: string, budget: Budget, who: string):
   let res: Response;
   const signal = AbortSignal.timeout(DOWNLOAD_TIMEOUT);
   try {
-    res = await modelFetch(url, { signal });
+    res = await withRetry(who, () => modelFetch(url, { signal }));
   } catch (e) {
     if (e instanceof Error && e.message === OFF_LIST) throw e;
+    if (e instanceof Refused) throw new Error(`${e.message}${REFUSED_HINT}`);
     throw new Error(isTimeout(e) ? `${who}下载超时` : `${who}连接失败`);
   }
   if (!res.ok || !res.body) { await res.body?.cancel().catch(() => {}); throw new Error(`${who}下载失败（${res.status}）`); }

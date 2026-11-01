@@ -34,7 +34,7 @@ flowchart LR
 ```sh
 npm ci
 cp .env.example .env          # 填 API 配置，变量说明见文件里的注释
-npx tsx --env-file=.env src/server.ts      # http://127.0.0.1:8787
+npm start                     # 读取 .env（没有也能启动），http://127.0.0.1:8787
 ```
 
 - `.env` 里配置 `ANTHROPIC_BASE_URL` / `ANTHROPIC_API_KEY` 后，Claude 走这个 API；Seedance、配音、听写、搜索、出图走 `SEEDANCE_*` / `RELAY_*` 配置的服务。
@@ -78,8 +78,13 @@ npm run check -- compose beats   # 只跑指定的几项
 推荐用一台 Linux 服务器（例如 Ubuntu 24.04，8 核 16G，不需要 GPU），安装 Node 22、Google Chrome、FFmpeg、`fonts-noto-cjk` 和 Nginx。`deploy/` 里是 systemd 和 Nginx 的配置模板，路径默认 `/opt/video_agent`，服务用户默认 `videoagent`。
 
 ```sh
-# 本机：同步代码（不带依赖、数据、密钥和第三方技能），写入版本号
-rsync -av --exclude node_modules --exclude data --exclude .git --exclude .env --exclude skills ./ <用户>@<服务器>:/opt/video_agent/
+# 本机：从当前提交导出干净的代码（只含 git 里的文件），再同步到服务器。
+# --delete 会删掉服务器上旧版本留下、这次已经不存在的文件；exclude 的路径（依赖、数据、密钥、第三方技能、版本号，
+# 以及服务器用不到的 benchmark 和调研资料）不会被同步，也不会被删。本项目自己的 skills/video-3d 照常同步。
+rm -rf /tmp/video_agent_export && mkdir /tmp/video_agent_export && git archive HEAD | tar -x -C /tmp/video_agent_export
+rsync -av --delete --exclude node_modules --exclude data --exclude .env --exclude BUILD.json \
+  --include 'skills/video-3d/***' --exclude 'skills/*' \
+  --exclude benchmark --exclude reports --exclude research_notes /tmp/video_agent_export/ <用户>@<服务器>:/opt/video_agent/
 ssh <用户>@<服务器> "echo '{\"commit\":\"$(git rev-parse --short HEAD)\",\"deployedAt\":\"$(date -Iseconds)\"}' > /opt/video_agent/BUILD.json"
 
 # 服务器：首次安装

@@ -193,7 +193,7 @@ export function planTools(ctx: Ctx, voiceover: Voiceover) {
           `${why}，需要重新生成 ${redo.length} 个写实镜头`,
           '已生成的写实镜头无法沿用，需按新要求重新生成。',
         );
-        if (!ok) return fail(`用户没有同意重新生成，计划没有改动。用一句话告诉用户保持原样了，不要再问一遍。`);
+        if (!ok) return fail(`用户没有同意重新生成，计划没有改动。简短地告诉用户保持原样了，不要再问一遍。`);
       }
       p.title = args.title;
       p.aspect = args.aspect;
@@ -274,7 +274,7 @@ export function planTools(ctx: Ctx, voiceover: Voiceover) {
       await ctx.store.save();
       ctx.emit({ type: 'script', ...script });
       return { content: [text(
-        `剧本卡第 ${script.version} 版已经显示给用户${changed.length ? `（改动的段：${changed.join('、')}）` : ''}。接下来用一句话说明${script.version > 1 ? '改了什么' : '这版的思路'}（可以省略）。用户说过"直接做""你看着办"这类话的，不问，紧接着开工（save_plan）；否则调用 ask_user 问用户按这版出片还是再改，再结束本轮，等用户回复。不要在文字里复述剧本。`,
+        `剧本卡第 ${script.version} 版已经显示给用户${changed.length ? `（改动的段：${changed.join('、')}）` : ''}。接下来简短地说明${script.version > 1 ? '改了什么' : '这版的思路'}（可以省略）。用户说过"直接做""你看着办"这类话的，不问，紧接着开工（save_plan）；否则调用 ask_user 问用户按这版出片还是再改，再结束本轮，等用户回复。不要在文字里复述剧本。`,
       )] };
     }),
   );

@@ -46,6 +46,8 @@ function stageOf(tool: string, input: Record<string, unknown>, drafting: boolean
     case 'read_document': return { stage: 'research', text: '正在读资料' };
     case 'render_clip_shot': return { stage: 'shots', text: drafting ? '正在剪素材' : `正在剪镜头 ${id}` };
     case 'use_footage': return { stage: 'research', text: '正在下载素材' };
+    case 'find_web_image': return { stage: 'research', text: '正在找图' };
+    case 'use_web_image': return { stage: 'research', text: '正在取图' };
     case 'preview_footage': return { stage: 'research', text: '正在看素材' };
     case 'render_footage_shot': return { stage: 'shots', text: drafting ? '正在剪素材' : `正在剪素材镜头 ${id}` };
     case 'present_script': return { stage: 'script', text: '正在写剧本' };
@@ -133,6 +135,19 @@ export function cleanBubble(text: string, userText: string) {
       if (/^[的了地得着过和与及或是在]/.test(rest) || (rest.match(/[㐀-鿿]/g) ?? []).length < 6) t = '';
     }
     // A lone stray character glued to the front ("柔: The user…" leaves "柔") is dropped with it.
+    // Planning notes in English with a few Chinese words inside ("Need brief card? Key ambiguity: (…, 健康平台 etc.)
+    // … then ask_user.我想先确认…"): leading sentences that are mostly Latin words go, up to the first Chinese one.
+    const parts = t.split(/(?<=[.?!。？！\n])/);
+    let drop = 0, words = 0;
+    for (const part of parts) {
+      const cjk = (part.match(/[㐀-鿿]/g) ?? []).length;
+      const latin = part.match(/[A-Za-z][A-Za-z'’-]*/g) ?? [];
+      if ((latin.length && !cjk) || (latin.length >= 3 && cjk / (cjk + latin.join('').length) < 0.25)) { drop++; words += latin.length; } else break;
+    }
+    if (drop && words >= 5) {
+      const rest = parts.slice(drop).join('').trim();
+      t = (rest.match(/[㐀-鿿]/g) ?? []).length >= 6 ? rest : '';
+    }
   }
   return t.trim();
 }
@@ -566,7 +581,7 @@ export class AgentSession {
       const flags = [...new Set(flagged.flatMap((s) => s.flags))];
       return `${m.id}「${m.name}」${m.kind === 'image' ? '图片' : `视频 ${Math.round(m.duration ?? 0)} 秒 ${m.segments.length} 段`}${flagged.length ? `，${flagged.length} 段有问题（${flags.join('、')}）` : ''}${m.summary ? `：${m.summary.slice(0, 80)}` : ''}`;
     };
-    const summary = `用户上传的素材入库好了。${ready.map(describe).join('；')}${bad.length ? `。这些没能入库：${bad.map((x) => `「${x.name}」（${x.error ?? '原因不明'}）`).join('、')}` : ''}。用 list_media 看每段的描述、标签和问题，用 inspect_media 细看，文档用 read_document 读。先用一两句自然的话告诉用户你看到了什么（有多少可用的、哪些有问题先不用），用户已经说了要做什么就接着做，还没说就问一句想做成什么样。`;
+    const summary = `用户上传的素材入库好了。${ready.map(describe).join('；')}${bad.length ? `。这些没能入库：${bad.map((x) => `「${x.name}」（${x.error ?? '原因不明'}）`).join('、')}` : ''}。用 list_media 看每段的描述、标签和问题，用 inspect_media 细看，文档用 read_document 读。先用几句自然的话告诉用户你看到了什么（有多少可用的、哪些有问题先不用），用户已经说了要做什么就接着做，还没说就问一句想做成什么样。`;
     // A turn is running (the agent may be cutting already): it hears this with its next tool result, and only
     // if that turn ends without another tool call is a turn started for it.
     if (this.pendingTurns > 0) {
@@ -634,7 +649,7 @@ export class AgentSession {
       failed.length ? `这些没生成成功：${failed.map((n) => `「${n.brief}」（${n.error ?? '原因不明'}）`).join('、')}` : '',
       pending.length ? `还在生成的：${pending.join('、')}` : '所有写实镜头都结束了',
     ].filter(Boolean);
-    this.queueSystem(`（系统通知，不是用户发的，不要原样转述，也不要提"系统""通知"：${parts.join('；')}。${pending.length ? '' : failed.length ? '先用一句话告诉用户哪个没成功、你打算怎么办（重试、改成动画或者换个拍法），需要用户拿主意就问；其他都齐了就接着做。' : '镜头都齐了：先用一句自然的话说一声在合成，然后调用 assemble_video 出片，出片后照常介绍并给建议。'}）`);
+    this.queueSystem(`（系统通知，不是用户发的，不要原样转述，也不要提"系统""通知"：${parts.join('；')}。${pending.length ? '' : failed.length ? '先简短地告诉用户哪个没成功、你打算怎么办（重试、改成动画或者换个拍法），需要用户拿主意就问；其他都齐了就接着做。' : '镜头都齐了：先用一句自然的话说一声在合成，然后调用 assemble_video 出片，出片后照常介绍并给建议。'}）`);
   }
 
   /** Starts (or queues behind the running one) a turn that the system, not the user, asked for. */
@@ -873,7 +888,7 @@ export class AgentSession {
     // Mid-project the agent knows what is possible better than the opener: a question or a "can't" from the
     // opener is not shown there, so it is steered to a plain "on it" line instead.
     const steer = opening.answeredCard
-      ? `${state}用户刚回答了需求卡（点选或者直接打字，这一条消息就是回答）。这时不要再提任何问题，也不要说出卡里没给的店名、产品这类事实；用 SCRIPT，用半句话复述选的结果，说马上写剧本给他看。`
+      ? `${state}用户刚回答了需求卡（点选或者直接打字，这一条消息就是回答）。这时不要再提任何问题，也不要说出卡里没给的店名、产品这类事实；用 SCRIPT，用一两句完整、自然的话说接下来写剧本给他看，可以顺带提一下他选的，但不要把选项串成一串复述。`
       : state ? `${state}这时用户的话一般是要改片或者追加东西（出图、加效果、换说法），用 WORK 或 SCRIPT 回一句"好，我……"（只是在问能做什么、和别人比怎么样，就用 REPLY 直接答），不要用 ASK 提问，也不要说做不到；以前对话里说过做不到的事，以能力清单为准。` : '';
     void writeOpener(recent, this.openingText(opening), opening.images, this.remembered, steer)
       .then((r) => {
@@ -1328,7 +1343,7 @@ export class AgentSession {
           // could take turns without end.
           if (!stopped && !quiet && !userWaiting && !this.emptyRetry && !this.languageRetry && !heldLine && this.toolCalls === 0 && !this.shownThisTurn() && m.subtype === 'success') {
             this.trace('empty_turn', { turnId: this.turnId });
-            this.queueSystem(`（系统提示，不是用户发的${EMPTY_RETRY_MARK}：你上一轮没有回复用户，也没有做任何事。接着处理用户刚才的消息，先用一句话回应，再开始做；不要提这条提示。）`);
+            this.queueSystem(`（系统提示，不是用户发的${EMPTY_RETRY_MARK}：你上一轮没有回复用户，也没有做任何事。接着处理用户刚才的消息，先简短回应，再开始做；不要提这条提示。）`);
           }
           // A new version the user was never told about in words: asked for once, in a turn of its own.
           if (madeVideo && !stopped && !userWaiting && !this.introRetry && !this.introducedVideo()) {

@@ -116,6 +116,14 @@ export const tts = {
   /** Estimate when no actual charge is returned: USD per 1000 characters. */
   usdPer1kChars: Number(env.TTS_USD_PER_1K_CHARS ?? 0.1),
 };
+/** Tavily: web search, page extraction and image search (https://docs.tavily.com). */
+export const tavily = {
+  apiKey: env.TAVILY_API_KEY ?? '',
+  url: (env.TAVILY_URL ?? 'https://api.tavily.com').replace(/\/+$/, ''),
+  /** USD per Tavily credit, to book the credits each call reports in the ledger. */
+  usdPerCredit: Number(env.TAVILY_USD_PER_CREDIT ?? 0.008),
+};
+export const tavilyReady = () => Boolean(tavily.apiKey);
 export const research = {
   geminiModel: env.RESEARCH_GEMINI_MODEL ?? 'gemini-3.5-flash',
   gptModel: env.RESEARCH_GPT_MODEL ?? 'gpt-5.5',

@@ -218,9 +218,11 @@ function sendFile(req: http.IncomingMessage, res: http.ServerResponse, file: str
     const start = range[1] ? Number(range[1]) : 0;
     const end = range[2] ? Math.min(Number(range[2]), size - 1) : size - 1;
     res.writeHead(206, { 'X-Content-Type-Options': 'nosniff', 'Content-Type': type, 'Content-Range': `bytes ${start}-${end}/${size}`, 'Accept-Ranges': 'bytes', 'Content-Length': end - start + 1 });
+    if (req.method === 'HEAD') return void res.end();
     createReadStream(file, { start, end }).pipe(res);
   } else {
     res.writeHead(200, { 'X-Content-Type-Options': 'nosniff', 'Content-Type': type, 'Content-Length': size, 'Accept-Ranges': 'bytes' });
+    if (req.method === 'HEAD') return void res.end();
     createReadStream(file).pipe(res);
   }
 }
@@ -230,14 +232,16 @@ const server = http.createServer(async (req, res) => {
     const url = new URL(req.url ?? '/', 'http://x');
     const parts = url.pathname.split('/').filter(Boolean);
 
-    if (req.method === 'GET' && (url.pathname === '/' || parts[0] === 'static')) {
+    // HEAD answers like GET without the body (health checks and caches use it).
+    const read = req.method === 'GET' || req.method === 'HEAD';
+    if (read && (url.pathname === '/' || parts[0] === 'static')) {
       // Always revalidated; the ETag keeps that to a 304 when nothing changed.
       res.setHeader('Cache-Control', 'no-cache');
       if (url.pathname === '/' && INDEX_HTML) {
         const etag = `"${PAGE_VERSION}"`;
         if (req.headers['if-none-match'] === etag) { res.writeHead(304, { ETag: etag }); return void res.end(); }
         res.writeHead(200, { 'X-Content-Type-Options': 'nosniff', 'Content-Type': MIME['.html'], ETag: etag });
-        return void res.end(INDEX_HTML);
+        return void res.end(req.method === 'HEAD' ? undefined : INDEX_HTML);
       }
       const rel = url.pathname === '/' ? 'index.html' : parts.slice(1).join('/');
       const file = normalize(join(PUBLIC, rel));
@@ -245,7 +249,7 @@ const server = http.createServer(async (req, res) => {
       return sendFile(req, res, file);
     }
 
-    if (req.method === 'GET' && parts[0] === 'files' && parts[1]) {
+    if (read && parts[0] === 'files' && parts[1]) {
       const base = resolve(SESSIONS, parts[1]);
       const file = normalize(join(base, ...parts.slice(2).map(decodeURIComponent)));
       // Session folders also hold model-written HTML; only media is ever served from them.

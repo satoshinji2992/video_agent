@@ -156,7 +156,7 @@ export function seedanceTools(ctx: Ctx) {
           `重新生成写实镜头「${s.brief.slice(0, 20)}」`,
           '该镜头已生成，重新生成将再次调用写实镜头服务。',
         );
-        if (!ok) return fail(`用户没有同意重新生成镜头 ${shot_id}。用一句话说明保留原来的片段（或者这个镜头可以改成动画），不要再问一遍。`);
+        if (!ok) return fail(`用户没有同意重新生成镜头 ${shot_id}。简短地说明保留原来的片段（或者这个镜头可以改成动画），不要再问一遍。`);
       }
       let firstFrame: string | undefined;
       if (first_frame) {
@@ -187,7 +187,7 @@ export function seedanceTools(ctx: Ctx) {
       if (audio) await writeFile(ctx.store.path(`clips/${inputHash}.prompt.txt`), prompt);
       runSeedance(ctx, { shotId: shot_id, inputHash, prompt, seconds: s.seconds, aspect: p.aspect, audio, model, imageUrls, firstFrame, estimate });
       await writeFile(ctx.store.path(`shots/${inputHash}.seedance.txt`), prompt);
-      return { content: [text(`镜头 ${shot_id} 已提交（${seedanceMocked() ? '示意画面' : `${RESOLUTION}`}），在后台生成，一般一两分钟。每好一个，界面会自动把预览发给用户；全部好了（或者有失败）系统会再叫你，那时再合成。现在接着做别的镜头，都提交完就用一句话告诉用户写实部分在拍、好一个发一个，然后结束这一轮，不要等。`)] };
+      return { content: [text(`镜头 ${shot_id} 已提交（${seedanceMocked() ? '示意画面' : `${RESOLUTION}`}），在后台生成，一般一两分钟。每好一个，界面会自动把预览发给用户；全部好了（或者有失败）系统会再叫你，那时再合成。现在接着做别的镜头，都提交完就简短地告诉用户写实部分在拍、好一个发一个，然后结束这一轮，不要等。`)] };
     }),
   );
   return { generateSeedanceShot };

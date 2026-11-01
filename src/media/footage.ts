@@ -14,6 +14,7 @@ import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, statSync, writ
 import { mkdir, open, rename, rm } from 'node:fs/promises';
 import { basename, dirname, join } from 'node:path';
 import { atomicOutput } from '../core/ffmpeg.ts';
+import { Refused, USER_AGENT, withRetry } from '../core/http.ts';
 
 export type FootageSource = 'nasa' | 'commons';
 
@@ -54,8 +55,10 @@ export interface ManifestEntry {
   /** File name inside the project's assets/ folder. */
   file: string;
   id: string;
-  /** Archive footage, or a 3D model from a model library (src/render/models.ts). */
-  source: FootageSource | 'polyhaven' | 'nasa3d' | 'svs';
+  /** Archive footage, a 3D model from a model library (src/render/models.ts), or a picture from the web (use_web_image). */
+  source: FootageSource | 'polyhaven' | 'nasa3d' | 'svs' | 'web';
+  /** Web pictures: the picture's own URL (pageUrl is the page it was found on). */
+  imageUrl?: string;
   kind: 'image' | 'video' | 'model';
   title: string;
   pageUrl: string;
@@ -72,8 +75,9 @@ export interface ManifestEntry {
   realShape?: boolean;
 }
 
-const UA = 'video-agent-demo/0.1 (footage search)';
-const HEADERS = { 'User-Agent': UA };
+export const HEADERS = { 'User-Agent': USER_AGENT };
+/** What the agent can do when a library keeps refusing. */
+const REFUSED_HINT = '可以换另一个素材库（sources），或者过一会儿再试；也可以用 find_web_image 在网上找（logo、产品图、照片），或者请用户直接发图片。';
 const SEARCH_TIMEOUT = 20_000;
 const MB = 1024 * 1024;
 const IMAGE_CAP = 15 * MB;
@@ -159,11 +163,12 @@ export async function safeFetch(raw: string, init: RequestInit): Promise<Respons
 async function getJson<T>(url: string, ms: number, who: string): Promise<T> {
   let res: Response;
   try {
-    res = await safeFetch(url, { headers: HEADERS, signal: AbortSignal.timeout(ms) });
+    const signal = AbortSignal.timeout(ms);
+    res = await withRetry(who, () => safeFetch(url, { headers: HEADERS, signal }));
   } catch (e) {
+    if (e instanceof Refused) throw new Error(`${e.message}${REFUSED_HINT}`);
     throw new Error(isTimeout(e) ? `${who}响应超时` : `${who}连接失败`);
   }
-  if (res.status === 429) throw new Error(`${who}请求太频繁，稍后再试`);
   if (!res.ok) throw new Error(`${who}返回错误 ${res.status}`);
   try {
     return (await res.json()) as T;
@@ -762,17 +767,22 @@ class TooLarge extends Error {
   }
 }
 
+const hostName = (url: string) => (/wikimedia\.org/.test(url) ? 'Wikimedia Commons' : /nasa\.gov/.test(url) ? 'NASA 素材库' : '素材库');
+
 /** Streams `url` into `dest`, aborting once more than `cap` bytes arrive. */
 async function download(url: string, dest: string, cap: number, ms: number): Promise<void> {
   let res: Response;
   try {
-    res = await safeFetch(url, { headers: HEADERS, signal: AbortSignal.timeout(ms) });
+    const signal = AbortSignal.timeout(ms);
+    res = await withRetry(hostName(url), () => safeFetch(url, { headers: HEADERS, signal }));
   } catch (e) {
+    // The status stays in the message as （403）: downloadFirst moves on to the next rendition for those.
+    if (e instanceof Refused) throw new Error(`素材下载失败（${e.status}）：${e.message}${REFUSED_HINT}`);
     throw new Error(isTimeout(e) ? '素材下载超时' : e instanceof Error && e.message.includes('允许') ? e.message : '素材下载失败（网络错误）');
   }
   if (!res.ok || !res.body) {
     await res.body?.cancel().catch(() => {});
-    throw new Error(res.status === 429 ? '素材下载请求太频繁，稍后再试' : `素材下载失败（${res.status}）`);
+    throw new Error(`素材下载失败（${res.status}）`);
   }
   if (Number(res.headers.get('content-length')) > cap) {
     await res.body.cancel().catch(() => {});

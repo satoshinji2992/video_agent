@@ -70,7 +70,7 @@ export function imageTools(ctx: Ctx, { hookNote, frozenNote }: Notes) {
       const fit = s.fit ?? (media && graphic ? 'contain' : 'cover');
       // Archive stills sometimes come padded with black (a square frame on a 16:9 canvas): that is cut away.
       // Only archive files: a logo on black is a picture, not bars.
-      const archive = !media && readManifest(ctx.store.dir).some((m) => m.file === file);
+      const archive = !media && readManifest(ctx.store.dir).some((m) => m.file === file && (m.source === 'nasa' || m.source === 'commons'));
       const inputHash = hashInputs('image', readFileSync(src).length, file, mv, s.seconds, p.aspect, fit, ...(archive ? ['bars'] : []));
       const clip = ctx.store.path(`clips/${inputHash}.mp4`);
       let cropped = false;

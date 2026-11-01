@@ -34,7 +34,7 @@
 | `vo/` | 配音片段（`.mp3`），按文字、音色、模型和语速的哈希缓存；`.take.mp3` 是整段合成的原始录音。 |
 | `assets/` | 镜头用到的素材：生成的图片、下载的资料片和 3D 模型（`md-*.glb`）。`assets/raw/` 是用户上传的原文件，上传过程中的分片在 `assets/raw/.part/`。 |
 | `media_index.json` | 上传素材的索引：编号（`m1`…）、类型、时长、画质标记、语音转写、画面描述。由 `src/media/ingest.ts` 维护。 |
-| `assets_manifest.json` | 下载素材的来源、许可和署名，生成片尾署名时使用。 |
+| `assets_manifest.json` | 下载素材的来源、许可和署名，生成片尾署名时使用。网络图片的 `source` 是 `web`，另记 `pageUrl`、`imageUrl` 和 `fetchedAt`。 |
 | `.claude/skills/` | 已启用技能的链接，供 Claude Agent SDK 按项目设置加载。 |
 | `.deleting` | 删除标记：对话已被删除，等后台任务结束后移入 `trash/`。 |
 

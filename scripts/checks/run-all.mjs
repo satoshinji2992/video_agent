@@ -26,6 +26,7 @@ const CHECKS = [
   ['colormatch', ['npx', 'tsx', 'scripts/checks/colormatch-check.ts']],
   ['stabilize', ['npx', 'tsx', 'scripts/checks/stabilize-check.ts']],
   ['ingest', ['npx', 'tsx', 'scripts/checks/ingest-check.ts'], { devset: true }],
+  ['webimage', ['npx', 'tsx', 'scripts/checks/webimage-check.ts']],
   ['seedance-ledger', ['npx', 'tsx', 'scripts/checks/seedance-ledger-test.ts']],
   ['pipeline-smoke', ['npx', 'tsx', 'scripts/checks/pipeline-smoke.ts']],
   ['3d-route', ['npx', 'tsx', 'scripts/checks/3d-route-check.ts']],

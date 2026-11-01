@@ -1,14 +1,16 @@
-// Builds report-vab-task1.md (Chinese): side-by-side table of our two runs (v1/v2) and Grok on the user's
-// VideoAgentBench Task 1 rubric, automatic checks, revision metrics, plus the hand-written gap analysis
+// Builds the Chinese report for one task (VAB_TASK, default vab-t1; report-vab-task1.md for Task 1, report-<task>.md
+// otherwise): side-by-side table of our two runs (v1/v2) and the external system on the task's rubric, automatic checks, revision metrics, plus the hand-written gap analysis
 // (notes/vab-gaps.md) and method notes (notes/vab-method.md).
 //
-// Usage: node vab-report.mjs
+// Usage: VAB_TASK=vab-t2 node vab-report.mjs
 import { existsSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { P, readJson, SC } from './lib.mjs';
+import { P, readJson, SC, topicById } from './lib.mjs';
 
-const VAB = join(SC, 'vab');
-const OUT = join(SC, 'report-vab-task1.md');
+const TASK = topicById(process.env.VAB_TASK ?? 'vab-t1');
+// Same folders as vab-eval.mjs: Task 1 keeps its original names.
+const VAB = join(SC, TASK.id === 'vab-t1' ? 'vab' : TASK.id);
+const OUT = join(SC, TASK.id === 'vab-t1' ? 'report-vab-task1.md' : `report-${TASK.id}.md`);
 const COLS = [
   ['run1-v1', '我们 run1 · v1'], ['run1-v2', '我们 run1 · v2'], ['run2-v1', '我们 run2 · v1'], ['run2-v2', '我们 run2 · v2'], ['grok', 'Grok（仅 Stage A）'],
 ];
@@ -27,12 +29,12 @@ const data = Object.fromEntries(COLS.map(([k]) => [k, {
   sc: readJson(join(VAB, k, 'scores.json'), null),
 }]));
 const rev = Object.fromEntries(['run1', 'run2'].map((r) => [r, readJson(join(VAB, `${r}-revision.json`), null)]));
-const runs = Object.fromEntries(['run1', 'run2'].map((r) => [r, readJson(join(P.runs, `vab-t1-${r}.json`), null)]));
+const runs = Object.fromEntries(['run1', 'run2'].map((r) => [r, readJson(join(P.runs, `${TASK.id}-${r}.json`), null)]));
 const stageOf = (k) => { const m = /^(run\d)-v([12])$/.exec(k); return m ? runs[m[1]]?.stages?.[Number(m[2]) - 1] : null; };
 
 const L = [];
 const push = (...xs) => L.push(...xs);
-push('# VideoAgentBench v0.2 · Task 1（DART）评测报告', '');
+push(`# VideoAgentBench v0.2 · Task ${TASK.id.replace('vab-t', '')}（${TASK.title}）评测报告`, '');
 const stamp = new Date().toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai', hour12: false });
 const introFile = join(P.notes, 'vab-intro.md');
 if (existsSync(introFile)) push(`生成时间：${stamp}（北京时间）。`, '', readFileSync(introFile, 'utf8').trim(), '');
@@ -72,7 +74,7 @@ row('参考：A 经 relay 通道算的 /100', (d) => n1(d.sc?.judgeA_relay?.tota
 row('补充：C gemini-3.1-pro-preview /100（3 次）', (d) => (d.sc?.judgeC?.ok ? `${n1(d.sc.judgeC.total)}（${d.sc.judgeC.totalSamples.map(n1).join(' / ')}）` : '—'));
 sect('隐藏关注点（A / B，多数票）');
 const verdict = (d, j, id) => { const s = d.sc?.[j]; if (!s?.ok) return '—'; const votes = s.samples.filter((x) => x.ok).map((x) => x.data.hidden_points?.find((h) => h.id === id)?.verdict).filter(Boolean); const rank = { no: 0, partial: 1, yes: 2 }; votes.sort((a, b) => rank[a] - rank[b]); const v = votes[Math.floor((votes.length - 1) / 2)]; return { yes: '✓', partial: '△', no: '✗' }[v] ?? '—'; };
-const hidden = readJson(join(SC, 'vab-tasks.json'))[0].hidden;
+const hidden = TASK.hidden;
 hidden.forEach((h, i) => row(`H${i + 1} ${h.replace(/^是否/, '').replace(/。$/, '')}`, (d) => `${verdict(d, 'judgeA', `H${i + 1}`)} / ${verdict(d, 'judgeB', `H${i + 1}`)}`));
 sect('修改阶段（v2 对 v1，0–10）');
 for (const [m, label] of REV) row(label, (d, k) => { const r = /-v2$/.test(k) ? rev[k.slice(0, 4)] : null; return r ? `A ${n1(r.judgeA?.metrics?.[m]?.value)} / B ${n1(r.judgeB?.metrics?.[m]?.value)}${r.judgeC?.ok ? ` / C ${n1(r.judgeC.metrics?.[m]?.value)}` : ''}` : '—'; });

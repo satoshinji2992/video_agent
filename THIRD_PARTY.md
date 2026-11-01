@@ -37,5 +37,6 @@
 - Wikimedia Commons：按条目许可，只采用允许用于剪辑成片的许可（公有领域、CC0、CC BY、CC BY-SA）。
 - Poly Haven：CC0。
 - NASA 3D Resources、NASA SVS：按条目许可。
+- 网络图片（`find_web_image` / `use_web_image`）：任意公开网页上的图片，包括 App Store 图标；不核实版权，只记录页面地址、图片地址和获取时间，署名为"网络图片（站点）"。
 
 这些素材不在仓库里。

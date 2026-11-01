@@ -205,8 +205,9 @@ try {
   }
 
   // --- User-Agent ---------------------------------------------------------------------------------------------
-  const wrongUa = requests.filter((r) => r.ua !== 'video_agent');
-  check(requests.length > 0 && !wrongUa.length, `User-Agent 'video_agent' on all ${requests.length} requests${wrongUa.length ? `; not on ${wrongUa[0]!.url}` : ''}`);
+  // Poly Haven wants the software named ('video_agent'), Wikimedia a contact URL: video_agent/<version> (+https://…).
+  const wrongUa = requests.filter((r) => !/^video_agent\/\S+ \(\+https:\/\/\S+\)$/.test(r.ua ?? ''));
+  check(requests.length > 0 && !wrongUa.length, `User-Agent 'video_agent/<version> (+<url>)' on all ${requests.length} requests${wrongUa.length ? `; not on ${wrongUa[0]!.url} (${wrongUa[0]!.ua})` : ''}`);
   check(requests.every((r) => /^https:\/\//.test(r.url)), 'every request over https');
   // Worker threads share the process, so this covers the optimisation too.
   const native = ((process.report.getReport() as { sharedObjects?: string[] }).sharedObjects ?? []).filter((f) => /sharp|vips/i.test(f));

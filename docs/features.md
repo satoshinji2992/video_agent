@@ -76,3 +76,13 @@
 - **上限**：默认总上限 100 美元，到 80% 时提醒一次。超出上限的调用会被拒绝，agent 会在对话里告诉用户。
 - **网页显示**：金额不出现在对话里。侧栏底部「系统」入口有状态圆点：绿色表示正常，黄色表示用量超过 80% 或写实镜头处于示意画面模式，红色表示额度用完。系统面板的「用量」页有总额、按对话的花费和明细。达到 80% 时只弹一次右上角提示。
 - **币种**：服务商按人民币扣费的，用 `USD_CNY_RATE` 换算成美元记账，标为「实际」；按单价表算的标为「估算」。
+
+## 联网查资料和网络图片
+
+- **查资料**（`research`，src/providers/research.ts）：优先用 Tavily 搜索（advanced）。排名靠前的结果摘要太短时，再用 Tavily extract 读原文，截取和查询相关的一段。交给模型的是逐条原文摘录，每条带原始链接、站点和发布日期（有的话），剧本卡的来源直接用这些链接。可以限定站点（`domains`，比如只查 nasa.gov）和时间范围（`time_range`）。Tavily 没配置或失败时，退回中转站的 Gemini（Google 搜索）和 GPT（web search），由它们写要点。每次调用按 Tavily 返回的 credits 记账（`TAVILY_USD_PER_CREDIT`），额度用完就拒绝。
+- **找图**（`find_web_image`）：给了 App 或品牌名时，先查 App Store 的公开接口（itunes.apple.com/search，不用密钥），拿 512 像素图标；再用 Tavily 搜图，候选带图片描述。候选编号为 w1、w2…，缩略图拼成一张图给模型看，另外列出相关页面。
+- **取图**（`use_web_image`，src/media/webimage.ts）：接受候选编号，或者任何 https 图片 / 网页地址。网页会从 logo 图片、apple-touch-icon、图标、og:image 和页面主图里挑（最多 4 张）。网页的 HTML 里取不到时，用无头 Chrome 打开页面兜底（src/render/webpage.ts）：页面上实际显示的图片重新下载；下载不了的，或者 inline SVG 形式的 logo（链接到首页、带 logo 字样、在页头），就对元素截图。
+- **安全**：所有请求只接受 https 和默认端口，不能带账号密码。主机名解析出来的每个地址都必须是公网地址：本机、内网、链路本地、CGNAT、云厂商元数据（169.254.169.254、100.100.100.200）、组播和保留地址一律拒绝。直连时连接固定在检查过的那个地址上，防止 DNS 被换成别的答案。重定向手动逐跳检查，最多 5 次。网页上限 2 MB，图片上限 10 MB。按文件头判断格式，并要和 content-type 一致。位图解码后重新编码成 PNG，长边最多 2048。SVG 只有在不含脚本和外部引用时才保留。浏览器兜底时，页面发出的每个请求都走同样的地址检查，service worker、WebSocket、音视频和下载都关掉。
+- **来源**：取到的图记进 `assets_manifest.json`：`source: "web"`、页面地址、图片地址、获取时间，署名为"网络图片（站点）"。用在图片镜头里时，和图库素材一样带来源角标，片尾也会列出。
+- **图库**（NASA、Wikimedia Commons、Poly Haven 等）：统一使用 User-Agent `video_agent/<版本> (+https://github.com/satoshinji2992/video_agent)`。遇到 403、429、5xx 时，隔 1 秒、3 秒各重试一次；有 Retry-After 就按它来，最多等 10 秒。还是失败时，报出是哪个库、什么状态、对方给的原因，并提示可以换库、稍后再试或者在网上找图（src/core/http.ts）。
+

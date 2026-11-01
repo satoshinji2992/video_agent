@@ -3,7 +3,7 @@
   "version": "1.0.0",
   "description": "Conversational AI video production agent (Claude Agent SDK, Seedance, FFmpeg, three.js)",
   "scripts": {
-    "start": "tsx src/server.ts",
+    "start": "tsx --env-file-if-exists=.env src/server.ts",
     "typecheck": "tsc --noEmit",
     "check": "node scripts/checks/run-all.mjs",
     "skill:add": "tsx scripts/tools/skill-add.ts"

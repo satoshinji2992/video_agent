@@ -112,13 +112,13 @@ export function assembleTools(ctx: Ctx, { modelIn }: Notes) {
         const timedOut = await Promise.race([done.then(() => false), new Promise<boolean>((r) => setTimeout(() => r(true), ASSEMBLE_WAIT_MS).unref())]);
         if (timedOut) {
           const names = waiting.map((s) => s.brief).join('、');
-          return fail(`这些写实镜头还在生成：${names}。不用等，它们好了系统会叫你，那时再合成。用一句话告诉用户还在拍、好一个发一个，然后结束这一轮。`);
+          return fail(`这些写实镜头还在生成：${names}。不用等，它们好了系统会叫你，那时再合成。简短地告诉用户还在拍、好一个发一个，然后结束这一轮。`);
         }
       }
       const notReady = p.shots.filter((s) => s.status !== 'ready' || !s.clipFile);
       if (notReady.length) {
         return fail('这些镜头还没有可用的片段：' + notReady.map((s) => `${s.id}(${s.kind}, ${s.status}${s.error ? '：' + s.error : ''})`).join('；') +
-          '。code 镜头可以直接重新渲染；seedance 镜头失败的话用一句话告诉用户你打算怎么办（重做或改成动画），重做就直接调用工具，需要确认时界面会弹出确认卡。');
+          '。code 镜头可以直接重新渲染；seedance 镜头失败的话简短地告诉用户你打算怎么办（重做或改成动画），重做就直接调用工具，需要确认时界面会弹出确认卡。');
       }
       const { width, height } = FRAME_SIZE[p.aspect];
       const size = { width, height, fps: config.fps };
@@ -238,7 +238,7 @@ export function assembleTools(ctx: Ctx, { modelIn }: Notes) {
         const lines = [...new Set(used.map((m) => isModel(m)
           ? `${m.credit}（${realShape(m) ? '实测形状模型' : '三维示意模型'}）`
           : `${m.credit.replace(/\s*\/\s*Wikimedia Commons$/i, '')}${m.needsAttribution ? `（${m.license}）` : ''}`))];
-        const LIBRARIES: Record<string, string> = { nasa: 'NASA Image and Video Library', commons: 'Wikimedia Commons', polyhaven: 'Poly Haven', nasa3d: 'NASA 3D Resources', svs: 'NASA Scientific Visualization Studio' };
+        const LIBRARIES: Record<string, string> = { nasa: 'NASA Image and Video Library', commons: 'Wikimedia Commons', polyhaven: 'Poly Haven', nasa3d: 'NASA 3D Resources', svs: 'NASA Scientific Visualization Studio', web: '网络公开页面' };
         const found = [...new Set(used.map((m) => LIBRARIES[m.source as string] ?? String(m.source)))];
         lines.push(`素材取自 ${found.join('、')}`);
         if (p.shots.some((s) => s.kind === 'seedance' || (s.kind === 'image' && !creditOf(s)))) lines.push('部分画面为 AI 生成示意');
@@ -454,7 +454,7 @@ export function assembleTools(ctx: Ctx, { modelIn }: Notes) {
       const file = `versions/v${v.n}.release.md`;
       await writeFile(ctx.store.path(file), body);
       ctx.emit({ type: 'file', name: `第${v.n}版-发布文案.md`, url: fileUrl(ctx, file), label: '发布文案' });
-      return { content: [text(`发布文案已保存，用户可以下载（${file}）。署名已经附在文末。用一句话告诉用户就行。`)] };
+      return { content: [text(`发布文案已保存，用户可以下载（${file}）。署名已经附在文末。简短地告诉用户就行。`)] };
     }),
   );
   return { assembleVideo, saveReleaseNotes };

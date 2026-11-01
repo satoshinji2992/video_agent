@@ -1,0 +1,31 @@
+{
+  "name": "video-agent-demo",
+  "version": "1.0.0",
+  "description": "Conversational AI video production agent (Claude Agent SDK, Seedance, FFmpeg, three.js)",
+  "scripts": {
+    "start": "tsx src/server.ts",
+    "typecheck": "tsc --noEmit",
+    "check": "node scripts/checks/run-all.mjs",
+    "skill:add": "tsx scripts/tools/skill-add.ts"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "MIT",
+  "type": "module",
+  "private": true,
+  "dependencies": {
+    "@anthropic-ai/claude-agent-sdk": "^0.3.316",
+    "@gltf-transform/core": "^4.5.1",
+    "@gltf-transform/extensions": "^4.5.1",
+    "@gltf-transform/functions": "^4.5.1",
+    "draco3dgltf": "^1.5.9",
+    "meshoptimizer": "^1.3.0",
+    "playwright-core": "^1.64.1",
+    "tsx": "^4.23.15",
+    "zod": "^4.6.7"
+  },
+  "devDependencies": {
+    "@types/node": "^26.6.6",
+    "typescript": "^7.0.2"
+  }
+}

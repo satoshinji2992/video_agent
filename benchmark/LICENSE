@@ -1,0 +1,20 @@
+VideoAgentBench content: Creative Commons Attribution 4.0 International (CC BY 4.0)
+https://creativecommons.org/licenses/by/4.0/
+Full legal code: https://creativecommons.org/licenses/by/4.0/legalcode
+
+Copyright (c) 2026 The video agent authors
+
+Covered by CC BY 4.0:
+- the task specifications (VideoAgentBench_50_tasks.pdf, benchmark-v0.2.md);
+- the asset packs (task1-dart, task2-coffee, task3-glitch: prompts, footage, photos, audio, store profile,
+  evaluator files), distributed as GitHub Release attachments and checked by packs/SHA256SUMS;
+- the pack documentation and the generation prompt specs (packs/README.md, tools/specs/).
+
+You may share and adapt this material for any purpose, including commercially, as long as you give
+appropriate credit ("VideoAgentBench, The video agent authors"), link to the license and indicate
+if changes were made.
+
+The code in this folder (harness/, scripts/, tools/scripts/) is under the MIT License in ../LICENSE.
+
+All footage, photos, menus, logos and ambience sound in the packs are AI-generated (Seedance,
+gpt-image-2, Seedream). The shop, its owners and every person shown are fictional.

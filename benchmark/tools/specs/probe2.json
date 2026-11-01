@@ -1,0 +1,33 @@
+[
+  {
+    "id": "ref_face_zhou",
+    "slug": "ref_face_test",
+    "task": "probe",
+    "seconds": 4,
+    "aspect": "9:16",
+    "audio": true,
+    "refs": ["work/stills/owner_zhou_a-2.png"],
+    "prompt": "参考图片里的这位男店主（戴黑框眼镜，深灰色长袖T恤，深棕色帆布围裙），站在咖啡店浅色原木吧台后面，低头用白毛巾擦一个玻璃杯，然后抬头对着镜头笑了一下。竖屏手机实拍，手持轻微晃动，早晨自然光，色彩真实没有调色。实时正常速度。一个连续镜头，没有剪辑。画面里没有任何文字。声音只有现场环境声，没有背景音乐。"
+  },
+  {
+    "id": "ff_face_mei",
+    "slug": "firstframe_face_test",
+    "task": "probe",
+    "seconds": 4,
+    "aspect": "9:16",
+    "audio": true,
+    "firstFrame": "work/frames/owner_mei_a-2_916.png",
+    "prompt": "女店主低头整理吧台上的两个白色陶瓷杯，然后抬头对着镜头自然地笑了一下。竖屏手机实拍，手持轻微晃动，早晨自然光，色彩真实没有调色。实时正常速度。一个连续镜头，没有剪辑。画面里没有任何文字。声音只有现场环境声，没有背景音乐。"
+  },
+  {
+    "id": "ff_plus_ref",
+    "slug": "mixed_mode_test",
+    "task": "probe",
+    "seconds": 4,
+    "aspect": "9:16",
+    "audio": true,
+    "firstFrame": "work/frames/storefront_a-2_916.png",
+    "refs": ["work/stills/interior_a-1.jpg"],
+    "prompt": "从弄堂对面拍咖啡店门面，手机慢慢往前走向玻璃门。店里的样子和参考图片一致。竖屏手机实拍，手持轻微晃动，早晨自然光，色彩真实没有调色。实时正常速度。一个连续镜头，没有剪辑。除了招牌上原有的字，画面里没有任何文字。声音只有现场环境声，没有背景音乐。"
+  }
+]

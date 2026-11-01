@@ -1,0 +1,581 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<!-- 爆炸图（手机六层）：倒角挤出(Extrude)外壳/中框/玻璃 + 圆角盒(RoundedBox)元件，贴图全部用画布现画（屏幕界面、主板走线与丝印、电池标签）；
+     光照 = 准备阶段用 JS 算一个工作室环境并烘成 HDR 光照球（matcap），层间软阴影烘进贴图，地面接触阴影；
+     各层错峰沿 Y 轴分开，HTML/SVG 引线标签依次画出。CPU 软渲染 2 倍超采样下每帧也只要几十毫秒。 -->
+<style>
+  html, body { margin: 0; width: 100%; height: 100%; overflow: hidden; background: radial-gradient(110% 85% at 55% 45%, #fbfcfd 0%, #e8ebf0 55%, #cfd5de 100%); }
+  canvas { display: block; position: fixed; inset: 0; }
+  /* 暗角：纯 CSS，零渲染开销 */
+  #vignette { position: fixed; inset: 0; pointer-events: none; background: radial-gradient(130% 100% at 50% 45%, rgba(0,0,0,0) 60%, rgba(20,28,40,0.16) 100%); }
+  #hud { position: fixed; inset: 0; font-family: "Noto Sans CJK SC", sans-serif; color: #0f141c; pointer-events: none; }
+  #title { position: absolute; left: 7%; right: 7%; top: 6%; font-size: 6.6vmin; font-weight: 900; letter-spacing: 0.02em; }
+  #sub { position: absolute; left: 7%; right: 7%; top: calc(6% + 9.4vmin); font-size: 3.3vmin; font-weight: 500; color: #5a6575; letter-spacing: 0.06em; }
+  @media (min-aspect-ratio: 1/1) { #title { top: 11%; } #sub { top: calc(11% + 9.4vmin); } }
+  /* 引线标签：SVG 画线，HTML 写字（都走浏览器排版，超采样下边缘锐利） */
+  #leaders { position: fixed; inset: 0; width: 100%; height: 100%; pointer-events: none; overflow: visible; }
+  #leaders path { fill: none; stroke: #1d2633; stroke-width: 1.1; stroke-linecap: round; stroke-linejoin: round; }
+  #leaders circle { fill: #fff; stroke: #1d2633; stroke-width: 1.2; }
+  .lbl { position: absolute; left: 0; top: 0; white-space: nowrap; font-weight: 700; font-size: 3.1vmin; color: #121822;
+         padding: 0.55vmin 1.5vmin; border-radius: 99px; background: rgba(255,255,255,0.86); box-shadow: 0 0.3vmin 1.2vmin rgba(20,30,45,0.14); }
+</style>
+<script type="importmap">
+{ "imports": { "three": "/vendor/three/build/three.module.js", "three/addons/": "/vendor/three/examples/jsm/" } }
+</script>
+</head>
+<body>
+<div id="vignette"></div>
+<svg id="leaders"></svg>
+<div id="hud"><div id="title">内部结构一览</div><div id="sub">六层结构 · 精密堆叠</div><div id="labels"></div></div>
+<script type="module">
+import * as THREE from 'three';
+import { RoundedBoxGeometry } from 'three/addons/geometries/RoundedBoxGeometry.js';
+import { mergeGeometries } from 'three/addons/utils/BufferGeometryUtils.js';
+
+// ================= 可改参数 =================
+const DURATION = 7;                         // 镜头秒数，按计划改
+// 从下到上六层：label = 标签文字；y = 爆炸后这一层底面（后边缘处）的高度（整机厚约 0.4，层距约 1）；
+// tilt = 分层后这一层绕自己的后边缘向镜头掀起的角度（度）。上面两层掀得多，下面的主板、电池才不会被屏幕整片挡住
+const LAYERS = [
+  { label: '铝合金后盖', y: 0, tilt: 0 },
+  { label: '一体化中框', y: 0.85, tilt: 0 },
+  { label: '高密度电池', y: 1.65, tilt: 0 },
+  { label: '主板与芯片', y: 2.45, tilt: 3 },
+  { label: '高清显示屏', y: 4.0, tilt: 7 },
+  { label: '强化玻璃盖板', y: 4.75, tilt: 6 },
+];
+const BODY_COLOR = '#4a515c';               // 后盖内侧阳极氧化色（深空灰）
+const FRAME_COLOR = '#d3d6db';              // 中框金属色（原色钛）；深色机身可改 '#5b616b'
+const PCB_COLOR = '#0c4234';                // 主板阻焊层底色（墨绿）；黑色主板可改 '#15181d'
+const WALLPAPER = ['#ff6b3d', '#d23cff', '#3a6bff', '#00c7b5']; // 屏幕壁纸的几团光色
+const SCREEN_TIME = '09:41', SCREEN_DATE = '11月1日 星期六';     // 锁屏上的时间和日期
+const BATTERY_TEXT = ['高密度电芯', '5000 mAh · 19.4 Wh', '3.87 V  锂离子聚合物电池']; // 电池标签三行
+const T_EXPLODE = 0.8;                      // 开始分层的时间（秒）；每层再错峰 0.18 秒
+const T_LABELS = 2.6;                       // 引线标签开始逐个画出的时间（秒）；每个再错峰 0.22 秒
+const LEAN = 0.32;                          // 分层时每升高 1 单位往后（远离镜头）错开多少：0 = 垂直堆叠；越大，下层露出越多
+
+// ---------- 准备阶段（异步）：先等字体，再同步建场景、烘焙光照，最后编译着色器并预热一帧 ----------
+// 系统在逐帧截图前会 await window.sceneReady（最多 30 秒）；renderFrame 自己也会等它。
+let draw; // 逐帧绘制函数 draw(t)，准备完成后赋值
+window.sceneReady = (async () => {
+  // 系统字体（Noto Sans CJK SC）不走网络，但仍先 load，确保画布写中文时字体已就绪
+  await Promise.all(['400', '500', '700', '900'].map((w) => document.fonts.load(`${w} 64px "Noto Sans CJK SC"`, '中文')));
+
+  const W = innerWidth, H = innerHeight, DPR = window.devicePixelRatio || 1; // DPR=2 时系统做 2 倍超采样
+  const clamp = (x, a = 0, b = 1) => Math.min(b, Math.max(a, x));
+  const seg = (t, a, b) => clamp((t - a) / (b - a));
+  const easeInOut = (x) => (x < 0.5 ? 4 * x * x * x : 1 - Math.pow(-2 * x + 2, 3) / 2);
+  const easeOut = (x) => 1 - Math.pow(1 - x, 3);
+  const easeOutBack = (x) => 1 + 2.2 * Math.pow(x - 1, 3) + 1.2 * Math.pow(x - 1, 2);
+  const lerp = (a, b, x) => a + (b - a) * x;
+  function mulberry32(a) { return () => { a |= 0; a = (a + 0x6d2b79f5) | 0; let t = Math.imul(a ^ (a >>> 15), 1 | a); t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t; return ((t ^ (t >>> 14)) >>> 0) / 4294967296; }; }
+  const rand = mulberry32(7);
+
+  // ---------- 渲染器：像素比跟随 devicePixelRatio（超采样才生效），ACES 色调映射，PCF 软阴影 ----------
+  const renderer = new THREE.WebGLRenderer({ antialias: false, alpha: true, preserveDrawingBuffer: true });
+  renderer.setPixelRatio(DPR);
+  renderer.setSize(W, H);
+  renderer.setClearColor(0, 0);                    // 透明，露出 CSS 渐变背景
+  renderer.toneMapping = THREE.ACESFilmicToneMapping;
+  renderer.toneMappingExposure = 1.0;
+  document.body.prepend(renderer.domElement);
+
+  // ---------- 画布贴图工具 ----------
+  const cv = (w, h) => { const c = document.createElement('canvas'); c.width = w; c.height = h; return [c, c.getContext('2d')]; };
+  // 各向异性过滤：斜着看的贴图（屏幕、标签、主板）不糊成一片；4 倍在软渲染下几乎不加时间
+  const ANISO = Math.min(4, renderer.capabilities.getMaxAnisotropy());
+  const tex = (c, srgb = true) => { const t = new THREE.CanvasTexture(c); if (srgb) t.colorSpace = THREE.SRGBColorSpace; t.anisotropy = ANISO; return t; };
+  // 由灰度高度图生成法线贴图（Sobel），strength 越大凹凸越明显
+  function normalFromHeight(src, strength = 2) {
+    const w = src.width, h = src.height, d = src.getContext('2d').getImageData(0, 0, w, h).data;
+    const [c, g] = cv(w, h), out = g.createImageData(w, h), o = out.data;
+    const hAt = (x, y) => d[(((y + h) % h) * w + ((x + w) % w)) * 4] / 255;
+    for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
+      const dx = (hAt(x + 1, y) - hAt(x - 1, y)) * strength, dy = (hAt(x, y + 1) - hAt(x, y - 1)) * strength;
+      const l = Math.hypot(dx, dy, 1), i = (y * w + x) * 4;
+      o[i] = (-dx / l * 0.5 + 0.5) * 255; o[i + 1] = (dy / l * 0.5 + 0.5) * 255; o[i + 2] = (1 / l * 0.5 + 0.5) * 255; o[i + 3] = 255;
+    }
+    g.putImageData(out, 0, 0); return tex(c, false);
+  }
+  // 挤出件的顶/底面 UV = 形状坐标；这个函数让一张画布正好铺满 w×h 的外形
+  const fitCaps = (t, w, h) => { t.repeat.set(1 / w, 1 / h); t.offset.set(0.5, 0.5); return t; };
+
+  // ---------- 形状工具：圆角矩形 / 任意多边形倒圆角；挤出成带倒角的板（Y 向上，底面在 y=0） ----------
+  function rrect(w, h, r, cx = 0, cy = 0) {
+    const s = new THREE.Shape(), x = cx - w / 2, y = cy - h / 2;
+    s.moveTo(x + r, y); s.lineTo(x + w - r, y); s.absarc(x + w - r, y + r, r, -Math.PI / 2, 0);
+    s.lineTo(x + w, y + h - r); s.absarc(x + w - r, y + h - r, r, 0, Math.PI / 2);
+    s.lineTo(x + r, y + h); s.absarc(x + r, y + h - r, r, Math.PI / 2, Math.PI);
+    s.lineTo(x, y + r); s.absarc(x + r, y + r, r, Math.PI, Math.PI * 1.5);
+    return s;
+  }
+  function roundedPoly(pts, r) {                   // pts: [[x,y],...]，每个拐角倒 r 的圆角
+    const s = new THREE.Shape(), n = pts.length, P = (i) => new THREE.Vector2(...pts[(i + n) % n]);
+    for (let i = 0; i < n; i++) {
+      const p = P(i), a = P(i - 1).sub(p).normalize().multiplyScalar(r).add(p), b = P(i + 1).sub(p).normalize().multiplyScalar(r).add(p);
+      if (i === 0) s.moveTo(a.x, a.y); else s.lineTo(a.x, a.y);
+      s.quadraticCurveTo(p.x, p.y, b.x, b.y);
+    }
+    s.closePath(); return s;
+  }
+  // bevelSegments=1 是 45° 倒角（机加工棱线），>1 是圆润的 2.5D 弧边
+  function slab(shape, thick, bevel, segs = 3, curve = 14) {
+    const g = new THREE.ExtrudeGeometry(shape, { depth: Math.max(0.001, thick - 2 * bevel), bevelEnabled: true, bevelThickness: bevel, bevelSize: bevel, bevelOffset: -bevel, bevelSegments: segs, curveSegments: curve });
+    g.rotateX(-Math.PI / 2); g.translate(0, bevel, 0);   // 形状的 +y（手机顶部）→ 世界 -z
+    return g;
+  }
+  const at = (g, x, y, z) => g.translate(x, y, z);       // 小工具：平移几何体
+  const merge = (gs) => mergeGeometries(gs.map((g) => (g.index ? g.toNonIndexed() : g))); // 同材质零件合成一个网格（少 draw call）
+  const P = (x, y, h = 0) => new THREE.Vector3(x, h, -y); // 形状坐标 (x,y) + 高度 h → 世界坐标
+
+  const scene = new THREE.Scene();
+
+  window.__three = { renderer, scene };                          // 让系统统计三角形数和贴图数
+  // ---------- 灯光烘焙（关键的提速手段）----------
+  // SwiftShader 是 CPU 软渲染：逐像素采样 PMREM 环境图 + 实时阴影，在 2 倍超采样下要 0.5 秒/帧以上；
+  // 在 GPU 上烘 PMREM 又要先编译一堆大着色器（准备阶段多 6 秒）。所以这里用 JS 直接算一个“工作室”：
+  // 天光渐变 + 顶部长条柔光箱 + 左侧主光条 + 右后轮廓光条 + 深色地面，再把它在一个球上积分成一张 HDR 光照球（matcap）：
+  //   R = 漫反射，G/B/A = 镜面反射（光滑 / 半哑 / 粗糙 三档模糊）。每个像素只查这一张 128×128 小图，
+  // 金属棱线、玻璃高光、菲涅尔边缘光都还在，速度接近无光照材质。代价：光照跟着镜头走（产品片里看不出来）。
+  // 想调光：改 studio() 里各灯的亮度/位置（方向是镜头坐标：x 右、y 上、z 朝向镜头）。
+  const sstep = (a, b, x) => { const u = clamp((x - a) / (b - a)); return u * u * (3 - 2 * u); };
+  function studio(x, y, z, soft) {                 // soft = 灯边缘的柔和程度
+    let L = lerp(0.16, 0.62, sstep(-0.45, 0.1, y)) + 0.5 * sstep(0.15, 0.95, y);            // 地面暗 → 地平线 → 天顶的大渐变
+    L += 5.0 * sstep(0.9 - soft, 0.9 + soft, y) * sstep(-0.62 - soft, -0.62 + soft, -Math.abs(x));      // 顶部长条柔光箱
+    L += 4.0 * sstep(-0.72 + soft, -0.72 - soft, x) * sstep(-0.55 - soft, -0.55 + soft, -Math.abs(y - 0.25)); // 左侧主光条
+    L += 3.0 * sstep(0.7 - soft, 0.7 + soft, x) * sstep(0.25 + soft, 0.25 - soft, z) * sstep(-0.45 - soft, -0.45 + soft, -Math.abs(y - 0.3)); // 右后轮廓光
+    L += 0.35 * sstep(0.75, 1.0, z);                                                       // 正面补光
+    return L;
+  }
+  const CAP = {};
+  {
+    const N = 128, data = new Uint16Array(N * N * 4), half = THREE.DataUtils.toHalfFloat;
+    const fib = (n, i) => { const r = Math.sqrt((i + 0.5) / n), a = i * 2.39996; return [r * Math.cos(a), r * Math.sin(a)]; }; // 圆盘上均匀分布的采样点
+    const blur = (rx, ry, rz, spread, n, soft) => {                                        // 反射方向周围一个锥体内取平均 = 粗糙度
+      const tx = Math.abs(rz) < 0.9 ? [rz, 0, -rx] : [0, rz, -ry], tl = Math.hypot(...tx), t1 = tx.map((v) => v / tl);
+      const t2 = [ry * t1[2] - rz * t1[1], rz * t1[0] - rx * t1[2], rx * t1[1] - ry * t1[0]];
+      let sum = 0;
+      for (let i = 0; i < n; i++) {
+        const [u, v] = fib(n, i), dx = rx + spread * (u * t1[0] + v * t2[0]), dy = ry + spread * (u * t1[1] + v * t2[1]), dz = rz + spread * (u * t1[2] + v * t2[2]), l = Math.hypot(dx, dy, dz);
+        sum += studio(dx / l, dy / l, dz / l, soft);
+      }
+      return sum / n;
+    };
+    const K = [-0.5, 0.72, 0.48], kl = Math.hypot(...K);                                     // 主光方向（左前上方）
+    for (let j = 0; j < N; j++) for (let i = 0; i < N; i++) {
+      let x = ((i + 0.5) / N - 0.5) / 0.495, y = ((j + 0.5) / N - 0.5) / 0.495;            // 和 matcap 取样公式对应：uv → 法线
+      const l = Math.hypot(x, y); if (l > 0.999) { x *= 0.999 / l; y *= 0.999 / l; }
+      const z = Math.sqrt(1 - x * x - y * y), rx = 2 * z * x, ry = 2 * z * y, rz = 2 * z * z - 1; // 反射方向
+      const dif = 0.85 * blur(x, y, z, 1.6, 48, 0.3) + 1.1 * Math.max(0, (x * K[0] + y * K[1] + z * K[2]) / kl);
+      const o = (j * N + i) * 4;
+      data[o] = half(dif); data[o + 1] = half(studio(rx, ry, rz, 0.03)); data[o + 2] = half(blur(rx, ry, rz, 0.22, 24, 0.08)); data[o + 3] = half(blur(rx, ry, rz, 0.5, 40, 0.15));
+    }
+    CAP.tex = new THREE.DataTexture(data, N, N, THREE.RGBAFormat, THREE.HalfFloatType);
+    CAP.tex.magFilter = CAP.tex.minFilter = THREE.LinearFilter; CAP.tex.needsUpdate = true;
+  }
+  // lit()：用法和 MeshStandardMaterial 一样（color / map / normalMap / roughness / metalness / emissive / transparent…）
+  const LIT_HOOK = function (sh) {
+    Object.assign(sh.uniforms, this.userData.u);
+    sh.vertexShader = sh.vertexShader.replace('#include <common>', '#include <common>\n#ifdef SWEEP\nvarying vec3 vWP;\n#endif')
+      .replace('#include <fog_vertex>', '#include <fog_vertex>\n#ifdef SWEEP\n vWP = (modelMatrix * vec4(transformed, 1.0)).xyz;\n#endif');
+    sh.fragmentShader = sh.fragmentShader.replace('uniform sampler2D matcap;', 'uniform sampler2D matcap; uniform vec3 uW; uniform float uMetal, uRough, uSpecK, uSweep; uniform vec3 uEmissive;\n#ifdef SWEEP\nvarying vec3 vWP;\n#endif')
+      .replace('vec3 outgoingLight = diffuseColor.rgb * matcapColor.rgb;', `
+  vec3 spec = vec3(dot(matcapColor.gba, uW));   // 三档镜面按粗糙度混合
+  float fres = pow(1.0 - clamp(dot(normal, viewDir), 0.0, 1.0), 5.0);
+  vec3 f0 = mix(vec3(0.04 * uSpecK), diffuseColor.rgb, uMetal);
+  vec3 outgoingLight = diffuseColor.rgb * matcapColor.r * (1.0 - uMetal) + (f0 + (max(vec3(1.0 - uRough), f0) - f0) * fres) * spec + uEmissive;
+  #ifdef SWEEP
+    // 玻璃 = 贴图底色（预乘透明度：中间淡淡的青灰、边上黑色油墨）+ 反射。
+    // 平板玻璃各处法线相同，光照球给的反射是一整片均匀的白；这里按世界坐标叠两条斜向反光带（一宽一窄），其余地方几乎全透
+    float gu = vWP.x * 0.42 - vWP.z * 0.28;
+    float streak = 0.1 + 0.85 * exp(-pow((gu - 0.15) / 0.32, 2.0)) + 0.7 * exp(-pow((gu - 0.95) / 0.07, 2.0));
+    outgoingLight = diffuseColor.rgb * diffuseColor.a + streak * (f0 + 0.3 * fres) * spec / (1.0 + 0.6 * spec);
+    float sw = vWP.x * 0.5 - vWP.z * 0.42 - uSweep;   // 扫光：沿对角线移动的一条亮带
+    outgoingLight += vec3(0.55) * exp(-sw * sw * 90.0);
+  #endif`);
+  };
+  function lit({ roughness = 0.5, metalness = 0, emissive = 0x000000, specular = 1, ...rest } = {}) {
+    const m = new THREE.MeshMatcapMaterial({ matcap: CAP.tex, ...rest });
+    const r = clamp(roughness, 0.05, 0.5), hi = r > 0.22;
+    m.userData.u = {
+      uW: { value: hi ? new THREE.Vector3(0, 1 - (r - 0.22) / 0.28, (r - 0.22) / 0.28) : new THREE.Vector3(1 - (r - 0.05) / 0.17, (r - 0.05) / 0.17, 0) },
+      uMetal: { value: metalness }, uRough: { value: roughness }, uSpecK: { value: specular }, uEmissive: { value: new THREE.Color(emissive) }, uSweep: { value: -10 },
+    };
+    m.onBeforeCompile = LIT_HOOK;
+    return m;
+  }
+
+  // ---------- 材质 ----------
+  const std = lit;
+  const M = {
+    frame: std({ color: FRAME_COLOR, metalness: 1, roughness: 0.16 }),
+    dark: std({ color: 0x1a1d22, roughness: 0.4 }),                                    // 天线隔断/开孔/塑料
+    steel: std({ color: 0xdde1e6, metalness: 1, roughness: 0.24 }),                    // 屏蔽罩/螺丝/接口
+    gold: std({ color: 0xe0b45a, metalness: 1, roughness: 0.25 }),
+    anod: std({ color: 0x2a2e35, metalness: 0.8, roughness: 0.3 }),                    // 摄像头支架
+    flex: std({ color: 0xc77a22, roughness: 0.3, metalness: 0.1 }),                    // 排线（聚酰亚胺）
+  };
+
+  // ---------- 零件 ----------
+  const PW = 3.2, PD = 6.6, R = 0.52;             // 整机宽、长、外圆角
+  const BAT = { w: 2.5, d: 3.4, h: 0.18, z: 1.0 }; // 电池尺寸和位置（世界 z，正值 = 手机底部 = 靠镜头）
+  // 主板外形（形状坐标，+y = 手机顶部）：上半部主板 + 右侧窄条一直到底部 Type-C
+  const BOARD_OUTLINE = [[-1.42, 0.3], [0.85, 0.3], [0.85, -2.3], [-0.55, -2.3], [-0.55, -3.0], [1.42, -3.0], [1.42, 3.12], [-1.42, 3.12]];
+  // ---------- 层间软阴影：直接烘进下层的贴图里（运行时零开销）----------
+  // 上层轮廓画成模糊黑影（模糊半径、错开距离都随层距变大，方向 = 主光从左前上方照下），按 opacity 叠到本层贴图上。
+  // 画布里用世界坐标 (x, z) 作画：传入 k（每单位像素）和世界原点在画布上的位置 (ox, oz)。
+  const rr = (g, w, d, r, x = 0, z = 0) => { g.beginPath(); g.roundRect(x - w / 2, z - d / 2, w, d, r); g.fill(); };
+  const boardPath = (g) => { g.beginPath(); BOARD_OUTLINE.forEach(([x, y], i) => (i ? g.lineTo(x, -y) : g.moveTo(x, -y))); g.closePath(); g.fill(); };
+  const gapOf = (i) => LAYERS[i + 1].y - LAYERS[i].y;
+  function bakeShadow(g, k, ox, oz, casters, gap, opacity) {
+    const q = 0.25, [c, s] = cv(Math.ceil(g.canvas.width * q), Math.ceil(g.canvas.height * q)), kq = k * q;  // 1/4 分辨率上模糊，省时间
+    s.filter = `blur(${Math.max(1, Math.round(gap * 0.2 * kq))}px)`; s.fillStyle = '#0a0f18';
+    s.setTransform(kq, 0, 0, kq, (ox + gap * 0.22 * k) * q, (oz - gap * (0.28 + LEAN) * k) * q); casters(s);  // 上层本身也往后错开了 LEAN×层距
+    g.save(); g.setTransform(1, 0, 0, 1, 0, 0); g.globalAlpha = opacity; g.drawImage(c, 0, 0, g.canvas.width, g.canvas.height); g.restore();
+  }
+  let dispFlex, glassSweep;
+  const groups = LAYERS.map(() => { const g = new THREE.Group(); scene.add(g); return g; });
+  const add = (gi, geo, mat) => { const m = new THREE.Mesh(geo, mat); groups[gi].add(m); return m; };
+
+  // ===== 0 后盖：圆润弧边；内侧画石墨散热膜、摄像头开孔、二维码；中央铜线圈无线充电 =====
+  {
+    const w = PW - 0.1, d = PD - 0.1, k = 160, [c, g] = cv(Math.round(w * k), Math.round(d * k));
+    g.fillStyle = BODY_COLOR; g.fillRect(0, 0, c.width, c.height);
+    for (let i = 0; i < 3000; i++) { g.fillStyle = `rgba(255,255,255,${rand() * 0.04})`; g.fillRect(rand() * c.width, rand() * c.height, 2, 2); }
+    const gr = g.createLinearGradient(0, c.height * 0.38, c.width, c.height); gr.addColorStop(0, '#2b2e33'); gr.addColorStop(0.5, '#3a3d43'); gr.addColorStop(1, '#25282c');
+    g.fillStyle = gr; g.beginPath(); g.roundRect(0.25 * k, 2.55 * k, (w - 0.5) * k, (d - 2.85) * k, 0.18 * k); g.fill();   // 石墨膜
+    g.fillStyle = '#e0a93a'; g.fillRect(0.5 * k, 2.8 * k, 0.35 * k, 0.18 * k); g.fillRect((w - 0.85) * k, (d - 0.6) * k, 0.35 * k, 0.18 * k); // 黄色胶带
+    g.fillStyle = '#3c424b'; g.beginPath(); g.roundRect(0.18 * k, 0.18 * k, 1.3 * k, 1.3 * k, 0.28 * k); g.fill();         // 摄像头凸台内侧
+    for (const [x, y, r] of [[0.53, 0.53, 0.24], [0.53, 1.13, 0.24], [1.13, 0.83, 0.24], [1.18, 0.38, 0.08]]) { g.fillStyle = '#0b0c0e'; g.beginPath(); g.arc(x * k, y * k, r * k, 0, 7); g.fill(); }
+    g.fillStyle = '#e4e7eb'; g.font = `700 ${0.13 * k}px "Noto Sans CJK SC"`; g.fillText('7000 系列铝 · A2', 0.32 * k, (d - 0.2) * k);
+    g.fillStyle = '#fff'; g.fillRect(1.85 * k, 0.3 * k, 0.32 * k, 0.32 * k); g.fillStyle = '#111';
+    for (let i = 0; i < 64; i++) if (rand() > 0.5) g.fillRect((1.87 + (i % 8) * 0.035) * k, (0.32 + Math.floor(i / 8) * 0.035) * k, 0.035 * k, 0.035 * k);
+    bakeShadow(g, k, w / 2 * k, d / 2 * k, (s) => { rr(s, BAT.w, BAT.d, 0.06, 0, BAT.z); boardPath(s); }, gapOf(0) + gapOf(1), 0.5); // 电池 + 主板的影子
+    const capMat = std({ map: fitCaps(tex(c), w, d), metalness: 0.55, roughness: 0.42 });
+    add(0, slab(rrect(w, d, R - 0.05), 0.12, 0.04, 3), [capMat, std({ color: BODY_COLOR, metalness: 0.8, roughness: 0.3 })]);
+    // 无线充电线圈：画布画铜色同心圈 + 外圈磁铁阵列
+    const [cc, cg] = cv(512, 512), C = 256;
+    cg.fillStyle = '#26292e'; cg.beginPath(); cg.arc(C, C, 256, 0, 7); cg.fill();
+    for (let i = 0; i < 18; i++) { const a = (i / 18) * Math.PI * 2; cg.save(); cg.translate(C, C); cg.rotate(a); cg.fillStyle = i % 2 ? '#4a4f57' : '#3d4249'; cg.fillRect(212, -30, 40, 60); cg.restore(); }
+    const cu = cg.createRadialGradient(C - 60, C - 80, 20, C, C, 200); cu.addColorStop(0, '#f7c48e'); cu.addColorStop(0.6, '#c87a3e'); cu.addColorStop(1, '#8b4b22');
+    cg.fillStyle = cu; cg.beginPath(); cg.arc(C, C, 200, 0, 7); cg.fill();
+    cg.strokeStyle = 'rgba(60,25,8,0.55)'; cg.lineWidth = 2.2; for (let r = 72; r < 200; r += 6.5) { cg.beginPath(); cg.arc(C, C, r, 0, 7); cg.stroke(); }
+    cg.fillStyle = '#16181b'; cg.beginPath(); cg.arc(C, C, 70, 0, 7); cg.fill();
+    cg.fillStyle = '#9aa1ab'; cg.font = '500 22px "Noto Sans CJK SC"'; cg.textAlign = 'center'; cg.fillText('无线充电', C, C + 8);
+    const coil = add(0, new THREE.CircleGeometry(0.92, 64).rotateX(-Math.PI / 2), std({ map: tex(cc), metalness: 0.75, roughness: 0.32 }));
+    coil.position.set(0, 0.123, 0.15);
+  }
+
+  // ===== 1 中框：圆角矩形环，45° 倒角棱线；8 条天线隔断；侧键；底部扬声器孔与 Type-C 开口 =====
+  {
+    const FH = 0.36, rail = 0.14;
+    const ring = rrect(PW, PD, R); ring.holes.push(rrect(PW - rail * 2, PD - rail * 2, R - rail));
+    add(1, slab(ring, FH, 0.03, 1, 20), M.frame);
+    const bands = [], dark = [], keys = [];
+    // 天线隔断：灰色塑料条嵌进侧壁，上下留出倒角、外侧只凸出 0.004，看起来是“嵌进去的缝”而不是浮在外面的黑棍
+    const AW = rail - 0.006, AH = FH - 0.09;
+    for (const sx of [-1, 1]) for (const z of [-PD / 2 + 1.0, PD / 2 - 1.0]) bands.push(at(new THREE.BoxGeometry(AW, AH, 0.04), sx * (PW / 2 + 0.004 - AW / 2), FH / 2, z));
+    for (const sz of [-1, 1]) for (const x of [-0.75, 0.75]) bands.push(at(new THREE.BoxGeometry(0.04, AH, AW), x, FH / 2, sz * (PD / 2 + 0.004 - AW / 2)));
+    add(1, merge(bands), std({ color: 0x80868f, roughness: 0.45 }));
+    // 侧键（左：操作键 + 音量 ±；右：电源）
+    for (const [x, z, len] of [[-1, -1.95, 0.32], [-1, -1.3, 0.5], [-1, -0.62, 0.5], [1, -1.1, 0.8]]) keys.push(at(new RoundedBoxGeometry(0.07, 0.14, len, 2, 0.03), x * (PW / 2 + 0.012), FH / 2, z));
+    add(1, merge(keys), M.frame);
+    // 底边（朝镜头）：Type-C 开口 + 两排扬声器孔
+    dark.push(at(new RoundedBoxGeometry(0.42, 0.11, 0.04, 2, 0.05), 0, FH / 2, PD / 2 - 0.005));
+    for (const sx of [-1, 1]) for (let i = 0; i < 6; i++) dark.push(at(new THREE.CylinderGeometry(0.024, 0.024, 0.03, 10).rotateX(Math.PI / 2), sx * (0.42 + i * 0.09), FH / 2, PD / 2 - 0.005));
+    add(1, merge(dark), M.dark);
+  }
+
+  // ===== 2 电池：圆角盒 + 亮面覆膜标签（画布印字、警示图标、条码）+ 排线和扣接座 =====
+  {
+    const { w: bw, d: bd, h: bh, z: cz } = BAT;
+    add(2, at(new RoundedBoxGeometry(bw, bh, bd, 3, 0.06), 0, bh / 2, cz), std({ color: 0x15171b, roughness: 0.32 }));
+    const k = 300, [c, g] = cv(Math.round((bw - 0.14) * k), Math.round((bd - 0.14) * k)), cw = c.width, ch = c.height;
+    const bg = g.createLinearGradient(0, 0, cw, ch); bg.addColorStop(0, '#1d2027'); bg.addColorStop(1, '#121418'); g.fillStyle = bg; g.fillRect(0, 0, cw, ch);
+    g.strokeStyle = 'rgba(255,255,255,0.12)'; g.lineWidth = 3; g.strokeRect(24, 24, cw - 48, ch - 48);
+    // 版式：上方主板会挡住标签靠后的一半，所以主标题和规格放在靠镜头的下半部（画布下方 = 手机底部），图标和条码放后面
+    g.textAlign = 'center'; g.fillStyle = '#ffffff'; g.font = `900 ${cw * 0.13}px "Noto Sans CJK SC"`; g.fillText(BATTERY_TEXT[0], cw / 2, ch * 0.66);
+    g.fillStyle = '#7fd1ff'; g.font = `700 ${cw * 0.085}px "Noto Sans CJK SC"`; g.fillText(BATTERY_TEXT[1], cw / 2, ch * 0.765);
+    g.fillStyle = '#c3cad4'; g.font = `500 ${cw * 0.058}px "Noto Sans CJK SC"`; g.fillText(BATTERY_TEXT[2], cw / 2, ch * 0.84);
+    g.fillStyle = '#7fd1ff'; g.fillRect(cw * 0.3, ch * 0.875, cw * 0.4, 6);                                   // 强调细线
+    for (let i = 0; i < 4; i++) {                                                                              // 警示图标（三角/圆）
+      const x = cw * (0.24 + i * 0.17), y = ch * 0.3; g.strokeStyle = '#d9dee6'; g.lineWidth = 6; g.beginPath();
+      if (i % 2) g.arc(x, y, 34, 0, 7); else { g.moveTo(x, y - 36); g.lineTo(x + 38, y + 30); g.lineTo(x - 38, y + 30); g.closePath(); }
+      g.stroke(); g.fillStyle = '#d9dee6'; g.fillRect(x - 4, y - 14, 8, 26);
+    }
+    for (let x = cw * 0.2; x < cw * 0.8; x += 6 + Math.floor(rand() * 3) * 4) { g.fillStyle = '#e6e9ee'; g.fillRect(x, ch * 0.4, 2 + Math.floor(rand() * 3) * 3, ch * 0.06); } // 条码
+    g.fillStyle = '#8e97a3'; g.font = `500 ${cw * 0.04}px "Noto Sans CJK SC"`; g.fillText('BAT-5000-A1  SN 7Q3X91K2', cw / 2, ch * 0.5);
+    bakeShadow(g, k, (bw - 0.14) / 2 * k, ((bd - 0.14) / 2 - cz) * k, boardPath, gapOf(2), 0.55);   // 主板的影子
+    const label = add(2, new THREE.PlaneGeometry(bw - 0.14, bd - 0.14).rotateX(-Math.PI / 2), std({ map: tex(c), roughness: 0.26, polygonOffset: true, polygonOffsetFactor: -2 }));
+    label.position.set(0, bh + 0.001, cz);
+    // 排线从电池顶边伸向主板扣接座
+    add(2, at(new THREE.BoxGeometry(0.42, 0.012, 0.85), -0.85, bh - 0.02, cz - bd / 2 - 0.35), M.flex);
+    add(2, at(new RoundedBoxGeometry(0.55, 0.06, 0.22, 2, 0.02), -0.85, bh + 0.01, cz - bd / 2 - 0.75), M.dark);
+  }
+
+  // ===== 3 主板：异形板 + 走线/焊盘/过孔/丝印画布（含法线和粗糙度/金属度贴图）+ 芯片、屏蔽罩、摄像头模组、接口 =====
+  {
+    const outline = BOARD_OUTLINE;
+    const minX = -1.42, maxX = 1.42, minY = -3.0, maxY = 3.12, bw = maxX - minX, bd = maxY - minY, BH = 0.05;
+    // 元件清单：[类型, x, y, 宽, 深]（形状坐标）——同一份清单既画丝印/焊盘，也生成 3D 元件
+    const comps = [
+      ['cam', -0.78, 2.42, 1.2, 1.2], ['soc', 0.48, 1.72, 0.82, 0.82],
+      ['shield', 0.58, 2.76, 1.0, 0.5], ['shield', -0.62, 0.95, 1.25, 0.78], ['shield', 0.78, 0.78, 0.66, 0.62],
+      ['chip', -0.12, 1.62, 0.3, 0.3], ['chip', 1.2, 1.72, 0.28, 0.42], ['chip', 1.15, -0.75, 0.32, 0.48], ['chip', 1.14, -1.75, 0.34, 0.3], ['chip', -0.05, -2.62, 0.3, 0.26],
+      ['conn', -0.85, 1.6, 0.55, 0.2], ['conn', 1.14, -0.05, 0.22, 0.42], ['conn', 1.14, -1.25, 0.22, 0.36],
+      ['usb', 0.48, -2.83, 0.74, 0.3],
+    ];
+    const inside = (x, y) => (x > minX + 0.06 && x < maxX - 0.06 && y > 0.36 && y < maxY - 0.06) || (x > 0.91 && x < maxX - 0.06 && y > minY + 0.06 && y < 0.4) || (x > -0.49 && x < maxX - 0.06 && y > minY + 0.06 && y < -2.36);
+    const free = (x, y, m = 0.06) => inside(x, y) && comps.every(([, cx, cy, w, d]) => Math.abs(x - cx) > w / 2 + m || Math.abs(y - cy) > d / 2 + m);
+    // 走线：从各元件引出的 45° 折线；同一组路径画三遍（颜色 / 高度 / 粗糙度金属度）
+    const traces = [];
+    for (let i = 0; i < 140; i++) {
+      let x = minX + rand() * bw, y = minY + rand() * bd; if (!inside(x, y)) continue;
+      const pts = [[x, y]], n = 2 + Math.floor(rand() * 3);
+      for (let j = 0; j < n; j++) { const dir = Math.floor(rand() * 8) * Math.PI / 4, L = 0.12 + rand() * 0.5; x += Math.cos(dir) * L; y += Math.sin(dir) * L; if (!inside(x, y)) break; pts.push([x, y]); }
+      if (pts.length > 1) traces.push({ pts, w: rand() < 0.2 ? 0.03 : 0.012 });
+    }
+    const vias = []; for (let i = 0; i < 260; i++) { const x = minX + rand() * bw, y = minY + rand() * bd; if (free(x, y, 0.03)) vias.push([x, y]); }
+    const passives = []; for (let i = 0; i < 900 && passives.length < 240; i++) { const x = minX + rand() * bw, y = minY + rand() * bd; if (free(x, y)) passives.push([x, y, rand() < 0.5]); }
+    const k = 300, [cc, cg] = cv(Math.round(bw * k), Math.round(bd * k)), [hc, hg] = cv(cc.width / 2, cc.height / 2);
+    function paint(g, s, mode) {                    // mode: 'color' 颜色 | 'height' 高度（生成法线贴图）
+      g.setTransform(s, 0, 0, -s, -minX * s, maxY * s);
+      const C = { color: [PCB_COLOR, '#1b6b52', '#d9ad55', '#e9eef2'], height: ['#000', '#5a5a5a', '#9a9a9a', '#3a3a3a'] }[mode];
+      g.fillStyle = C[0]; g.fillRect(minX, minY, bw, bd);
+      if (mode === 'color') for (let i = 0; i < 1800; i++) { g.fillStyle = `rgba(255,255,255,${rand() * 0.035})`; g.fillRect(minX + rand() * bw, minY + rand() * bd, 0.01, 0.01); }
+      g.strokeStyle = C[1]; g.lineCap = 'round'; g.lineJoin = 'round';
+      for (const tr of traces) { g.lineWidth = tr.w; g.beginPath(); tr.pts.forEach(([x, y], i) => (i ? g.lineTo(x, y) : g.moveTo(x, y))); g.stroke(); }
+      g.fillStyle = C[2];
+      for (const [x, y] of vias) { g.beginPath(); g.arc(x, y, 0.018, 0, 7); g.fill(); }
+      for (const [, cx, cy, w, d] of comps) {       // 元件周围一圈焊盘
+        for (let u = -w / 2; u <= w / 2 + 1e-6; u += 0.06) { g.fillRect(cx + u - 0.012, cy - d / 2 - 0.07, 0.024, 0.04); g.fillRect(cx + u - 0.012, cy + d / 2 + 0.03, 0.024, 0.04); }
+      }
+      for (const [x, y, r] of passives) { g.fillRect(x - (r ? 0.04 : 0.025), y - (r ? 0.025 : 0.04), 0.022, 0.022); g.fillRect(x + (r ? 0.018 : 0.003), y + (r ? 0.003 : 0.018), 0.022, 0.022); }
+      for (const [x, y] of [[-1.3, 3.0], [1.3, 3.0], [-1.3, 0.42], [1.3, -2.88], [-0.43, -2.88]]) { g.beginPath(); g.arc(x, y, 0.09, 0, 7); g.fill(); } // 螺丝孔焊环
+      g.strokeStyle = C[3]; g.lineWidth = 0.008;     // 丝印：元件框
+      for (const [type, cx, cy, w, d] of comps) if (type !== 'usb') g.strokeRect(cx - w / 2 - 0.1, cy - d / 2 - 0.1, w + 0.2, d + 0.2);
+      if (mode !== 'color') return;
+      g.fillStyle = C[3];
+      const txt = (str, x, y, size, rot = 0) => { g.save(); g.translate(x, y); g.scale(1 / s, -1 / s); g.rotate(rot); g.font = `700 ${size * s}px "Noto Sans CJK SC"`; g.fillText(str, 0, 0); g.restore(); };
+      const names = ['U1', 'U2201', 'U3300', 'C1204', 'R88', 'L5', 'J2', 'J3', 'Q12', 'FL7', 'C77', 'U900'];
+      comps.forEach(([, cx, cy, w, d], i) => txt(names[i % names.length], cx - w / 2 - 0.1, cy + d / 2 + 0.15, 0.1));
+      txt('MLB · REV 2.1', -1.32, 0.42, 0.13); txt('10 层堆叠', 1.02, -2.2, 0.12, -Math.PI / 2);
+      for (const [x, y] of [[-1.3, 1.5], [1.32, 2.6], [0.95, -2.85]]) { g.beginPath(); g.arc(x, y, 0.035, 0, 7); g.fill(); } // 光学定位点
+    }
+    paint(cg, k, 'color'); paint(hg, k / 2, 'height');
+    bakeShadow(cg, k, -minX * k, maxY * k, (s) => rr(s, PW - 0.32, PD - 0.32, R - 0.12), gapOf(3), 0.5); // 显示屏的影子
+    const pcbMat = std({ map: fitCaps(tex(cc), bw, bd), normalMap: fitCaps(normalFromHeight(hc, 3), bw, bd), roughness: 0.32 });
+    pcbMat.map.offset.set(-minX / bw, -minY / bd); pcbMat.normalMap.offset.copy(pcbMat.map.offset);
+    const board = add(3, slab(roundedPoly(outline, 0.12), BH, 0.01, 1, 4), [pcbMat, std({ color: 0x0a2e25, roughness: 0.6 })]);
+
+    // 芯片顶面贴图：激光刻字 + 1 脚标记
+    function chipTex(main, sub, base = '#191b20') {
+      const [c, g] = cv(256, 256); g.fillStyle = base; g.fillRect(0, 0, 256, 256);
+      const sh = g.createLinearGradient(0, 0, 256, 256); sh.addColorStop(0, 'rgba(255,255,255,0.08)'); sh.addColorStop(1, 'rgba(255,255,255,0)'); g.fillStyle = sh; g.fillRect(0, 0, 256, 256);
+      g.fillStyle = '#8d939c'; g.textAlign = 'center'; g.font = '700 52px "Noto Sans CJK SC"'; g.fillText(main, 128, 128);
+      g.font = '500 24px "Noto Sans CJK SC"'; g.fillText(sub, 128, 168); g.fillText('2648 · TW', 128, 198);
+      g.beginPath(); g.arc(30, 30, 9, 0, 7); g.fill(); return tex(c);
+    }
+    const BT = BH;                                    // 元件都放在板面上
+    const chipGeo = [], shieldGeo = [], connGeo = [], steelGeo = [];
+    for (const [type, x, y, w, d] of comps) {
+      if (type === 'soc') add(3, at(new RoundedBoxGeometry(w, 0.08, d, 2, 0.025), x, BT + 0.04, -y), std({ map: chipTex('SoC', '3nm · 8 核'), roughness: 0.32, metalness: 0.4 }));
+      if (type === 'chip') chipGeo.push(at(new RoundedBoxGeometry(w, 0.05, d, 1, 0.012), x, BT + 0.025, -y));
+      if (type === 'shield') shieldGeo.push(at(new RoundedBoxGeometry(w, 0.07, d, 2, 0.02), x, BT + 0.035, -y));
+      if (type === 'conn') connGeo.push(at(new THREE.BoxGeometry(w, 0.05, d), x, BT + 0.025, -y));
+      if (type === 'usb') steelGeo.push(at(new RoundedBoxGeometry(w, 0.2, d, 2, 0.08), x, BT + 0.1, -y));
+    }
+    for (const [x, y] of [[-1.3, 3.0], [1.3, 3.0], [-1.3, 0.42], [1.3, -2.88], [-0.43, -2.88]]) steelGeo.push(at(new THREE.CylinderGeometry(0.065, 0.065, 0.035, 16), x, BT + 0.017, -y));
+    add(3, merge(chipGeo), std({ map: chipTex('IC', 'PMIC'), roughness: 0.4, metalness: 0.2 }));
+    // 屏蔽罩：冲压钢片，表面密集小孔（画布）
+    const [sc, sg] = cv(256, 256); sg.fillStyle = '#c6ccd4'; sg.fillRect(0, 0, 256, 256); sg.fillStyle = '#7d858f';
+    for (let y = 22; y < 240; y += 14) for (let x = 22 + ((y / 14) % 2) * 7; x < 240; x += 14) { sg.beginPath(); sg.arc(x, y, 3, 0, 7); sg.fill(); }
+    sg.strokeStyle = '#eef1f4'; sg.lineWidth = 6; sg.strokeRect(8, 8, 240, 240);
+    add(3, merge(shieldGeo), std({ map: tex(sc), metalness: 1, roughness: 0.33 }));
+    add(3, merge(connGeo), M.gold);
+    add(3, merge(steelGeo), M.steel);
+    // 贴片阻容：实例化小方块（米色电容 / 黑色电阻）
+    const pas = new THREE.InstancedMesh(new THREE.BoxGeometry(0.06, 0.03, 0.035), std({ roughness: 0.5 }), passives.length);
+    const m4 = new THREE.Matrix4(), q = new THREE.Quaternion(), up = new THREE.Vector3(0, 1, 0);
+    passives.forEach(([x, y, r], i) => { m4.compose(new THREE.Vector3(x, BT + 0.015, -y), q.setFromAxisAngle(up, r ? 0 : Math.PI / 2), new THREE.Vector3(1, 1, 1)); pas.setMatrixAt(i, m4); pas.setColorAt(i, new THREE.Color(rand() < 0.6 ? 0xb89a6c : 0x24262a)); });
+    groups[3].add(pas);
+    // 摄像头模组：阳极氧化支架 + 三颗镜头（金属镜筒 + 镀膜镜片）+ 闪光灯
+    const [cx, cy] = [-0.78, 2.42];
+    add(3, at(new RoundedBoxGeometry(1.2, 0.08, 1.2, 3, 0.04), cx, BT + 0.04, -cy), M.anod);
+    const [lc, lg] = cv(256, 256);
+    let lgr = lg.createRadialGradient(128, 128, 10, 128, 128, 128); lgr.addColorStop(0, '#05060a'); lgr.addColorStop(0.45, '#141a3a'); lgr.addColorStop(0.62, '#3b2a6e'); lgr.addColorStop(0.7, '#0a0b10'); lgr.addColorStop(0.86, '#22252b'); lgr.addColorStop(0.93, '#c9ced6'); lgr.addColorStop(1, '#7c838d');
+    lg.fillStyle = lgr; lg.fillRect(0, 0, 256, 256);
+    lg.fillStyle = 'rgba(255,255,255,0.75)'; lg.beginPath(); lg.ellipse(96, 92, 22, 12, -0.6, 0, 7); lg.fill();
+    const lensMat = std({ map: tex(lc), roughness: 0.08, metalness: 0.3 });
+    const barrels = [], faces = [];
+    for (const [dx, dy] of [[-0.27, 0.27], [-0.27, -0.27], [0.27, 0]]) {
+      barrels.push(at(new THREE.CylinderGeometry(0.245, 0.26, 0.06, 40), cx + dx, BT + 0.11, -(cy + dy)));
+      faces.push(at(new THREE.CircleGeometry(0.235, 40).rotateX(-Math.PI / 2), cx + dx, BT + 0.141, -(cy + dy)));
+    }
+    add(3, merge(barrels), M.steel);
+    add(3, merge(faces), lensMat);
+    add(3, at(new THREE.CircleGeometry(0.075, 24).rotateX(-Math.PI / 2), cx + 0.3, BT + 0.081, -(cy + 0.36)), std({ color: 0xf3e9c8, roughness: 0.3, emissive: 0x6b5a2a }));
+    add(3, at(new THREE.CircleGeometry(0.07, 24).rotateX(-Math.PI / 2), cx + 0.3, BT + 0.081, -(cy - 0.36)), std({ color: 0x0b0c10, roughness: 0.1 }));
+  }
+
+  // ===== 4 显示模组：OLED 面板，画布画锁屏界面（壁纸光斑 + 时间 + 小组件 + 灵动岛）；底部排线外露 =====
+  {
+    const w = PW - 0.32, d = PD - 0.32, k = 240, [c, g] = cv(Math.round(w * k), Math.round(d * k)), cw = c.width, ch = c.height;
+    g.fillStyle = '#05060c'; g.fillRect(0, 0, cw, ch);
+    g.filter = `blur(${Math.round(cw * 0.09)}px)`;  // 壁纸：几团大光斑高斯模糊叠在一起
+    [[0.15, 0.25, 0.55, 2], [0.85, 0.42, 0.5, 1], [0.35, 0.72, 0.6, 0], [0.9, 0.9, 0.45, 3], [0.5, 0.48, 0.3, 1]].forEach(([x, y, r, i]) => { g.fillStyle = WALLPAPER[i]; g.beginPath(); g.arc(x * cw, y * ch, r * cw, 0, 7); g.fill(); });
+    g.filter = 'none';
+    const sheen = g.createLinearGradient(0, 0, cw, ch); sheen.addColorStop(0, 'rgba(255,255,255,0.10)'); sheen.addColorStop(0.5, 'rgba(255,255,255,0)'); sheen.addColorStop(1, 'rgba(0,0,0,0.25)'); g.fillStyle = sheen; g.fillRect(0, 0, cw, ch);
+    g.fillStyle = '#fff'; g.textAlign = 'center';
+    g.font = `600 ${cw * 0.06}px "Noto Sans CJK SC"`; g.fillText(SCREEN_TIME.replace(/^0/, ''), cw * 0.17, ch * 0.05);   // 状态栏
+    g.fillRect(cw * 0.76, ch * 0.036, cw * 0.012, ch * 0.012); g.fillRect(cw * 0.776, ch * 0.031, cw * 0.012, ch * 0.017); g.fillRect(cw * 0.792, ch * 0.026, cw * 0.012, ch * 0.022);
+    g.strokeStyle = '#fff'; g.lineWidth = 3; g.beginPath(); g.roundRect(cw * 0.83, ch * 0.026, cw * 0.09, ch * 0.022, 6); g.stroke(); g.fillRect(cw * 0.838, ch * 0.031, cw * 0.06, ch * 0.012);
+    g.fillStyle = '#000'; g.beginPath(); g.roundRect(cw * 0.36, ch * 0.022, cw * 0.28, ch * 0.034, ch * 0.017); g.fill();   // 灵动岛
+    g.fillStyle = 'rgba(255,255,255,0.88)'; g.font = `600 ${cw * 0.068}px "Noto Sans CJK SC"`; g.fillText(SCREEN_DATE, cw / 2, ch * 0.135);
+    g.fillStyle = '#fff'; g.font = `700 ${cw * 0.3}px "Noto Sans CJK SC"`; g.fillText(SCREEN_TIME, cw / 2, ch * 0.29);
+    for (let i = 0; i < 3; i++) {                     // 三个圆形小组件（环形进度）
+      const x = cw * (0.27 + i * 0.23), y = ch * 0.37; g.fillStyle = 'rgba(255,255,255,0.18)'; g.beginPath(); g.arc(x, y, cw * 0.085, 0, 7); g.fill();
+      g.strokeStyle = '#fff'; g.lineWidth = cw * 0.012; g.beginPath(); g.arc(x, y, cw * 0.06, -Math.PI / 2, -Math.PI / 2 + Math.PI * 2 * [0.72, 0.45, 0.9][i]); g.stroke();
+    }
+    g.fillStyle = 'rgba(255,255,255,0.16)'; g.beginPath(); g.roundRect(cw * 0.12, ch * 0.66, cw * 0.76, ch * 0.1, cw * 0.06); g.fill();  // 通知卡片
+    g.fillStyle = 'rgba(255,255,255,0.9)'; g.fillRect(cw * 0.18, ch * 0.685, cw * 0.4, ch * 0.012); g.fillStyle = 'rgba(255,255,255,0.55)'; g.fillRect(cw * 0.18, ch * 0.715, cw * 0.55, ch * 0.01);
+    for (const x of [0.2, 0.8]) { g.fillStyle = 'rgba(255,255,255,0.2)'; g.beginPath(); g.arc(cw * x, ch * 0.89, cw * 0.08, 0, 7); g.fill(); }
+    g.fillStyle = '#fff'; g.beginPath(); g.roundRect(cw * 0.33, ch * 0.965, cw * 0.34, ch * 0.008, 8); g.fill();          // 底部横条
+    const uiTex = fitCaps(tex(c), w, d);
+    add(4, slab(rrect(w, d, R - 0.12), 0.05, 0.008, 1, 12), [new THREE.MeshBasicMaterial({ map: uiTex, color: 0xf2f2f2 }), M.dark]);
+    const [fc, fg] = cv(128, 128); fg.fillStyle = '#c77a22'; fg.fillRect(0, 0, 128, 128); fg.strokeStyle = '#f0c27a'; fg.lineWidth = 2;
+    for (let x = 10; x < 128; x += 9) { fg.beginPath(); fg.moveTo(x, 0); fg.lineTo(x, 128); fg.stroke(); }
+    // 屏幕排线：合起来时藏在面板下，分层时向外滑出（draw 里按爆炸进度移动 dispFlex）
+    dispFlex = new THREE.Group(); groups[4].add(dispFlex);
+    dispFlex.add(new THREE.Mesh(at(new THREE.BoxGeometry(0.9, 0.012, 0.6), 0.35, -0.006, d / 2 - 0.32), std({ map: tex(fc), roughness: 0.38, metalness: 0.3 })));
+    dispFlex.add(new THREE.Mesh(at(new RoundedBoxGeometry(0.55, 0.05, 0.16, 2, 0.02), 0.35, -0.02, d / 2 - 0.1), M.dark));
+  }
+
+  // ===== 5 玻璃盖板：弧边玻璃；只叠加反射 + 按透明度压暗背后（单遍透明，比真实折射便宜得多）；边缘一圈黑色油墨 =====
+  {
+    // 贴图：rgb = 玻璃底色，alpha = 挡住背后多少。边上一圈 0.09 宽的黑色油墨（不透明），中间只有 GLASS_TINT 的一层淡色
+    const k = 120, [c, g] = cv(Math.round(PW * k), Math.round(PD * k)), ink = 0.09;
+    g.fillStyle = '#07090c'; g.beginPath(); g.roundRect(0, 0, c.width, c.height, R * k); g.fill();
+    const inner = () => { g.beginPath(); g.roundRect(ink * k, ink * k, c.width - 2 * ink * k, c.height - 2 * ink * k, (R - ink) * k); g.fill(); };
+    g.globalCompositeOperation = 'destination-out'; inner();                                  // 先挖空中间
+    g.globalCompositeOperation = 'source-over'; g.fillStyle = 'rgba(52,66,82,0.16)'; inner(); // 再填一层青灰，16% 不透明
+    const glass = lit({ map: fitCaps(tex(c), PW, PD), color: 0xffffff, roughness: 0.05, metalness: 0, specular: 1.6, transparent: true,
+      blending: THREE.CustomBlending, blendSrc: THREE.OneFactor, blendDst: THREE.OneMinusSrcAlphaFactor, blendSrcAlpha: THREE.OneFactor, blendDstAlpha: THREE.OneMinusSrcAlphaFactor });
+    glass.defines = { SWEEP: '' }; glassSweep = glass.userData.u.uSweep;
+    add(5, slab(rrect(PW, PD, R), 0.045, 0.02, 3, 16), glass).renderOrder = 2;
+  }
+
+  // 合起来时各层的高度（整机厚约 0.4）
+  const closedY = [0, 0, 0.12, 0.12, 0.31, 0.36];
+
+  // 地面接触阴影：画布上模糊的圆角矩形（比阴影接收平面便宜得多，地面大面积不用逐像素查阴影）
+  const [shc, shg] = cv(256, 400); shg.filter = 'blur(18px)'; shg.fillStyle = '#000'; shg.beginPath(); shg.roundRect(40, 40, 176, 320, 30); shg.fill();
+  const contact = new THREE.Mesh(new THREE.PlaneGeometry(PW * 1.45, PD * 1.25).rotateX(-Math.PI / 2), new THREE.MeshBasicMaterial({ map: tex(shc), transparent: true, depthWrite: false, opacity: 0.5, color: 0x1a2230 }));
+  contact.position.y = -0.004; contact.renderOrder = -1; scene.add(contact);
+
+  // ---------- 引线标签：每层一个锚点（零件局部坐标，选在朝镜头的右前侧，避免被上层挡住） ----------
+  const anchors = [P(1.2, -2.6, 0.12), P(1.4, -3.1, 0.36), P(0.95, -2.1, 0.18), P(1.15, -1.75, 0.11), P(1.1, -2.4, 0.05), P(1.2, -2.0, 0.045)];
+  const svg = document.getElementById('leaders'), labelsEl = document.getElementById('labels'), NS = 'http://www.w3.org/2000/svg';
+  svg.setAttribute('viewBox', `0 0 ${W} ${H}`);
+  const callouts = LAYERS.map((L) => {
+    const path = document.createElementNS(NS, 'path'), dot = document.createElementNS(NS, 'circle');
+    path.setAttribute('pathLength', '1'); path.setAttribute('stroke-dasharray', '1 1'); dot.setAttribute('r', '2.6');
+    svg.append(path, dot);
+    const el = document.createElement('div'); el.className = 'lbl'; el.textContent = L.label; labelsEl.append(el);
+    return { path, dot, el, h: 0, w: 0 };
+  });
+  callouts.forEach((c) => { c.h = c.el.offsetHeight; c.w = c.el.offsetWidth; });
+
+  // ---------- 每层的位姿：k = 分层进度（0 合起 → 1 分开，回弹时略超过 1）。升高的同时往后错开 LEAN，并绕后边缘掀起 tilt ----------
+  const pose = (i, k, o) => {
+    const rise = (LAYERS[i].y - closedY[i]) * k, a = THREE.MathUtils.degToRad(LAYERS[i].tilt || 0) * clamp(k, 0, 1.1);
+    o.rotation.x = -a;                                             // 前边缘（朝镜头）抬起
+    o.position.set(0, closedY[i] + rise + (PD / 2) * Math.sin(a), -LEAN * rise - (PD / 2) * (1 - Math.cos(a))); // 转轴在后边缘
+  };
+
+  // ---------- 相机：自动构图 ----------
+  // 每帧按当前镜头方向，把各层包围盒的角点投影到屏幕，反推镜头距离和画面平移，让产品正好落进“安全框”。
+  // 安全框 [左, 上, 右, 下] = 占画面宽高的比例；合起时用 closed，分开后过渡到 open（右边留给标签列，上边留给标题）。
+  // 改了层高/掀角/镜头角度都不用再手调构图，零件不会出画、不会压标题。
+  const camera = new THREE.PerspectiveCamera(28, W / H, 0.5, 200);
+  const portrait = W <= H;
+  const SAFE = portrait ? { closed: [0.12, 0.25, 0.88, 0.9], open: [0.04, 0.18, 0.66, 0.96] }
+                        : { closed: [0.38, 0.1, 0.9, 0.92], open: [0.34, 0.05, 0.68, 0.96] };
+  const AZ = portrait ? [-0.4, -0.16] : [-0.62, -0.3];   // 镜头方位角（起 → 止）：竖版更正对手机底边，堆叠更窄更高
+  const EL = [0.72, 0.46];                               // 镜头仰角（起 → 止，弧度）：从高俯视慢慢压低
+  const LABEL_X = portrait ? W * 0.69 : W * 0.71;        // 标签列的左边缘（CSS 像素）
+  const hudTitle = document.getElementById('title'), hudSub = document.getElementById('sub');
+  const v = new THREE.Vector3();
+  if (dispFlex) dispFlex.position.z = 0.42;              // 包围盒按排线滑出后的样子算
+  const localPts = groups.map((g) => { const b = new THREE.Box3().setFromObject(g); return [0, 1, 2, 3, 4, 5, 6, 7].map((n) => new THREE.Vector3(n & 1 ? b.max.x : b.min.x, n & 2 ? b.max.y : b.min.y, n & 4 ? b.max.z : b.min.z)); });
+  const ghost = new THREE.Object3D(), pts = [], fitBox = new THREE.Box3(), fc = new THREE.Vector3(), dir = new THREE.Vector3();
+  function fitCamera(rect, az, el) {
+    dir.set(Math.cos(el) * Math.sin(az), Math.sin(el), Math.cos(el) * Math.cos(az));
+    fitBox.setFromPoints(pts); fitBox.getCenter(fc);
+    camera.clearViewOffset();
+    const measure = (d) => {
+      camera.position.copy(fc).addScaledVector(dir, d); camera.lookAt(fc); camera.updateMatrixWorld();
+      const b = [1e9, 1e9, -1e9, -1e9];
+      for (const p of pts) { v.copy(p).project(camera); b[0] = Math.min(b[0], v.x); b[1] = Math.min(b[1], v.y); b[2] = Math.max(b[2], v.x); b[3] = Math.max(b[3], v.y); }
+      return b;
+    };
+    let d = 25, b;
+    for (let it = 0; it < 4; it++) { b = measure(d); d *= Math.max((b[2] - b[0]) / ((rect[2] - rect[0]) * 2), (b[3] - b[1]) / ((rect[3] - rect[1]) * 2)); }
+    b = measure(d);
+    // 平移用视口偏移（纯平移，不改透视）：包围盒中心 → 安全框中心
+    const tx = rect[0] + rect[2] - 1, ty = 1 - rect[1] - rect[3];
+    camera.setViewOffset(W, H, ((b[0] + b[2]) / 2 - tx) * W / 2, (ty - (b[1] + b[3]) / 2) * H / 2, W, H);
+  }
+
+  draw = (t) => {
+    // 爆炸：从最上层开始逐层错峰 0.18s 抬起（上层先走，层与层不会穿插），带轻微回弹和一点偏转
+    groups.forEach((g, i) => {
+      const d = (groups.length - 1 - i) * 0.18, k = seg(t, T_EXPLODE + d, T_EXPLODE + 1.4 + d);
+      pose(i, easeOutBack(k), g);
+      g.rotation.y = 0.07 * Math.sin(k * Math.PI) * (i % 2 ? 1 : -1);
+      if (i === 4) dispFlex.position.z = 0.42 * easeInOut(k);
+    });
+    glassSweep.value = lerp(-3.5, 3.5, easeInOut(seg(t, 0.15, 1.6)));   // 合盖状态下玻璃上扫过一道光
+    contact.material.opacity = lerp(0.55, 0.32, easeInOut(seg(t, T_EXPLODE, T_EXPLODE + 1.5)));
+    // 相机：3/4 俯视，缓慢环绕；构图跟着“镜头的分层进度” E（比零件早一点拉远），同时包住零件此刻的真实位置
+    const p = easeInOut(seg(t, 0, DURATION)), E = easeInOut(seg(t, T_EXPLODE - 0.5, T_EXPLODE + 1.1));
+    scene.updateMatrixWorld();
+    pts.length = 0;
+    groups.forEach((g, i) => {
+      pose(i, E, ghost); ghost.updateMatrix();
+      for (const q of localPts[i]) pts.push(q.clone().applyMatrix4(ghost.matrix), q.clone().applyMatrix4(g.matrixWorld));
+    });
+    fitCamera(SAFE.closed.map((x, j) => lerp(x, SAFE.open[j], E)), lerp(AZ[0], AZ[1], p), lerp(EL[0], EL[1], p));
+    // 标签：锚点投影到屏幕；标签按锚点高度排一列，自动避让；引线 = 锚点 → 斜线 → 水平线 → 标签
+    const items = callouts.map((c, i) => {
+      v.copy(anchors[i]).applyMatrix4(groups[i].matrixWorld).project(camera);
+      return { c, i, ax: (v.x + 1) / 2 * W, ay: (1 - v.y) / 2 * H, a: easeOut(seg(t, T_LABELS + i * 0.22, T_LABELS + 0.55 + i * 0.22)) };
+    }).sort((a, b) => a.ay - b.ay);
+    const gap = 6, top = portrait ? H * 0.2 : H * 0.08;
+    let yMin = top;
+    for (const it of items) { it.ly = Math.max(it.ay, yMin + it.c.h / 2); yMin = it.ly + it.c.h / 2 + gap; }
+    const over = yMin - (H - 12); if (over > 0) for (const it of items) it.ly -= over;
+    for (const { c, ax, ay, ly, a } of items) {
+      const lx = LABEL_X, ex2 = lx - 22;
+      c.path.setAttribute('d', `M${ax.toFixed(1)},${ay.toFixed(1)} L${ex2.toFixed(1)},${ly.toFixed(1)} L${(lx - 4).toFixed(1)},${ly.toFixed(1)}`);
+      c.path.setAttribute('stroke-dashoffset', (1 - clamp(a * 1.4)).toFixed(3));
+      c.path.style.opacity = a > 0 ? 0.85 : 0;
+      c.dot.setAttribute('cx', ax.toFixed(1)); c.dot.setAttribute('cy', ay.toFixed(1)); c.dot.style.opacity = clamp(a * 3);
+      const la = clamp((a - 0.35) / 0.65);
+      c.el.style.opacity = la; c.el.style.transform = `translate(${(lx + (1 - la) * 10).toFixed(1)}px, ${(ly - c.h / 2).toFixed(1)}px)`;
+    }
+    const a = easeOut(seg(t, 0.2, 1.0));
+    hudTitle.style.opacity = a; hudTitle.style.transform = `translateY(${(1 - a) * 3}vmin)`;
+    hudSub.style.opacity = easeOut(seg(t, 0.6, 1.4));
+    renderer.render(scene, camera);
+  };
+  // 注意：SwiftShader 下 compileAsync 会空等 5~10 秒；同步 compile + 预热一帧只要零点几秒
+  renderer.compile(scene, camera);           // 编译全部可见物体的着色器（此时所有物体都还可见）
+  draw(0);                                    // 预热一帧：上传贴图、链接着色器
+})();
+window.renderFrame = async (t) => { await window.sceneReady; draw(t); };
+</script>
+</body>
+</html>

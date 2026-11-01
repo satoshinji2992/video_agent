@@ -1,0 +1,26 @@
+# Template: adjust the install path (/opt/video_agent) and the service user (videoagent) to your server.
+[Unit]
+Description=Video agent demo
+After=network.target
+
+[Service]
+User=videoagent
+Group=videoagent
+WorkingDirectory=/opt/video_agent
+EnvironmentFile=/opt/video_agent/.env
+# Listen on loopback only; Nginx on the same host is the public entry point.
+Environment=HOST=127.0.0.1 PORT=8787 DATA_DIR=/opt/video_agent/data
+ExecStart=/opt/video_agent/node_modules/.bin/tsx src/server.ts
+Restart=on-failure
+RestartSec=3
+NoNewPrivileges=true
+ProtectSystem=full
+# The Claude Code CLI started by the Agent SDK writes session transcripts under ~/.claude, which resuming
+# a conversation needs. ProtectHome=true would hide the home directory even if it is listed in
+# ReadWritePaths, so mount an empty tmpfs over /home and bind back only this user's home.
+ProtectHome=tmpfs
+BindPaths=/home/videoagent
+ReadWritePaths=/opt/video_agent/data
+
+[Install]
+WantedBy=multi-user.target

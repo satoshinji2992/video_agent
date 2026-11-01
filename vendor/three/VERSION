@@ -1,0 +1,5 @@
+three@0.186.1 (npm, r186)
+build/: three.module.js + three.core.js from the npm tarball
+examples/jsm/: addons copied unmodified from the npm tarball (incl. objects/Sky.js)
+examples/fonts/helvetiker_bold.typeface.json: from github mrdoob/three.js tag r186 examples/fonts (MgOpen license, see LICENSE-helvetiker)
+examples/jsm/ model loading (unmodified from the npm tarball): loaders/GLTFLoader.js, loaders/DRACOLoader.js, libs/draco/gltf/draco_wasm_wrapper.js, libs/draco/gltf/draco_decoder.wasm, libs/meshopt_decoder.module.js, utils/SkeletonUtils.js (GLTFLoader import; BufferGeometryUtils.js already present). The pure-JS Draco fallback (draco_decoder.js) is left out: the scene browser has WebAssembly.

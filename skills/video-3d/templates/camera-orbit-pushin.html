@@ -1,0 +1,723 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<!-- 环绕 + 推近：蓝调时刻的程序化城市（种子随机），中轴大道通向中心扭转玻璃塔。
+     相机先高空环绕俯瞰，再缓动下降、推近到塔冠；前景低云视差、高度雾、两层朦胧远景天际线营造纵深；
+     推近时远处的地面、天际线和楼窗逐渐“失焦”变柔（景深感），焦点留在塔冠。
+     性能说明：渲染走 CPU 软件光栅（无 GPU），所以光照、反射、雾都在顶点里算，片元只做贴图/窗格这类便宜运算；
+     色调映射换成一条便宜的有理曲线（拟合 ACES + sRGB，省掉片元里的 pow）；
+     不用全屏后期（每个全屏通道都很贵）；暗角和标题下的压暗也不用 CSS 叠层（盖在 WebGL 画布上的全屏渐变层
+     每帧合成要 ~40ms），而是最后画一张铺满屏幕的网格、用乘法混合压暗，压暗系数逐顶点算，片元零运算。 -->
+<style>
+  html, body { margin: 0; width: 100%; height: 100%; overflow: hidden; background: #070c1c; }
+  canvas { display: block; position: fixed; inset: 0; }
+  #hud { position: fixed; inset: 0; font-family: "Noto Sans CJK SC", sans-serif; color: #fff; pointer-events: none; }
+  /* 文字放在字幕区（底部 20%）上方，避开画面中央的塔楼 */
+  #title { position: absolute; left: 7%; right: 7%; bottom: calc(22% + 6vmin); font-size: 7vmin; font-weight: 900; letter-spacing: 0.04em; text-shadow: 0 0.3vmin 0.8vmin rgba(0,0,0,0.9), 0 0.4vmin 2.5vmin rgba(0,0,0,0.8); }
+  #sub { position: absolute; left: 7%; right: 7%; bottom: 22%; font-size: 3.6vmin; font-weight: 500; letter-spacing: 0.12em; color: #b8e4ff; text-shadow: 0 0.2vmin 0.6vmin rgba(0,0,0,0.95), 0 0.3vmin 1.8vmin rgba(0,0,0,0.85); }
+</style>
+<script type="importmap">
+{ "imports": { "three": "/vendor/three/build/three.module.js", "three/addons/": "/vendor/three/examples/jsm/" } }
+</script>
+</head>
+<body>
+<div id="hud"><div id="title">从全景到核心</div><div id="sub">一座城市的中轴线</div></div>
+<script type="module">
+import * as THREE from 'three';
+import { ImprovedNoise } from 'three/addons/math/ImprovedNoise.js';
+
+// ======================= 可调参数（改这里就够了） =======================
+const DURATION = 7;                 // 镜头时长（秒）
+const SEED = 42;                    // 城市随机种子：换一个数就是另一座城市
+// 天空与雾（蓝调时刻）：天顶 / 地平线 / 落日方向的暖光 / 地平线以下的城市暖雾
+const SKY = { zenith: '#030920', horizon: '#1d3a6e', glow: '#f09a50', below: '#131a30' };
+const SUN_AZ = -2.3;                // 落日暖光所在方位角（弧度），决定塔身哪一侧有暖色轮廓光
+const FOG_DENSITY = 0.008;          // 雾浓度：越大远处越朦胧
+const FOG_HEIGHT = 18;              // 高度雾衰减高度：低处雾浓、高处通透
+const FAR_FOG = 380;                // 这个距离之外地面完全没入雾中（天际线就立在这条雾线上）
+// 城市
+const CITY_N = 41, STEP = 3.2;      // 网格数 × 间距；每 6 格一条大道，正中那条是中轴线
+const PLAZA_R = 12;                 // 中心广场半径（留给塔楼和裙楼）
+const WINDOW_LIT = 0.4;             // 窗户亮灯比例（0~1）
+// 中心塔楼
+const TOWER_H = 50;                 // 塔身高度（不含塔冠和塔尖）
+const TOWER_R = 4.4;                // 塔底半径
+const TWIST = 1.9;                  // 自下而上的扭转角（弧度）
+const RING_COUNT = 6;               // 发光环数量（逐个点亮）
+const ACCENT = '#5fe0ff';           // 发光环 / 扫描光颜色
+// 相机：方位角从 az[0] 转到 az[1]；距离、高度、注视高度、视角都从“全景”过渡到“核心”
+const CAM = {
+  az: [-0.9, 1.1],
+  dist: [92, 46], distPortrait: [118, 54],   // 竖屏画面窄，离远一点
+  height: [72, 34],
+  lookY: [20, 46],
+  fov: [42, 33],
+  pushStart: 0.3,                            // 推近从全片的这个比例处开始
+};
+const EXPOSURE = 1.1;               // 整体曝光
+const FOCUS_BLUR = 1.6;             // 推近时远景“失焦”程度（0 = 关闭景深感；越大远处越柔）
+const VIGNETTE = 0.55;              // 暗角强度（四角压暗）
+const SCRIM = 0.75;                 // 标题出现时，文字身后那片画面压暗的强度（保证字幕压在亮楼窗上也看得清）
+// ======================================================================
+
+// ---------- 准备阶段（异步）：先等字体，再同步建场景，最后异步编译着色器并预热一帧 ----------
+// 系统在逐帧截图前会 await window.sceneReady（最多 30 秒）；renderFrame 自己也会等它。
+let draw; // 逐帧绘制函数 draw(t)，准备完成后赋值
+window.sceneReady = (async () => {
+  // 系统字体（Noto Sans CJK SC）不走网络，但仍先 load，确保画布写中文时字体已就绪
+  await Promise.all(['500', '700', '900'].map((w) => document.fonts.load(`${w} 64px "Noto Sans CJK SC"`, '中文')));
+
+  const W = innerWidth, H = innerHeight;
+  const portrait = W <= H;
+  const clamp = (x, a = 0, b = 1) => Math.min(b, Math.max(a, x));
+  const seg = (t, a, b) => clamp((t - a) / (b - a));
+  const smooth = (a, b, x) => { const k = clamp((x - a) / (b - a)); return k * k * (3 - 2 * k); };
+  const easeInOut = (x) => (x < 0.5 ? 4 * x * x * x : 1 - Math.pow(-2 * x + 2, 3) / 2);
+  const easeOut = (x) => 1 - Math.pow(1 - x, 3);
+  const lerp = (a, b, x) => a + (b - a) * x;
+  function mulberry32(a) { return () => { a |= 0; a = (a + 0x6d2b79f5) | 0; let t = Math.imul(a ^ (a >>> 15), 1 | a); t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t; return ((t ^ (t >>> 14)) >>> 0) / 4294967296; }; }
+  const rand = mulberry32(SEED);
+  const v3 = (hex, k = 1) => { const c = new THREE.Color(hex); return `vec3(${(c.r * k).toFixed(4)}, ${(c.g * k).toFixed(4)}, ${(c.b * k).toFixed(4)})`; };
+
+  // 渲染器：像素比跟随 devicePixelRatio（系统用 2 倍超采样渲染再缩小，这里必须跟随才有效）
+  // 系统按 2 倍超采样时不再开 MSAA（软件渲染下很贵，超采样已经抗锯齿）；1 倍时开 MSAA 兜底
+  const renderer = new THREE.WebGLRenderer({ antialias: (window.devicePixelRatio || 1) < 2, preserveDrawingBuffer: true });
+  renderer.setPixelRatio(window.devicePixelRatio || 1);
+  renderer.setSize(W, H);
+  renderer.toneMapping = THREE.ACESFilmicToneMapping;   // 只为打开色调映射开关；实际曲线在下面 tonemapping_fragment 里换成便宜版
+  renderer.toneMappingExposure = EXPOSURE;
+  document.body.prepend(renderer.domElement);
+  // 地面贴图过滤：mip 只取最近一级、不开各向异性（软件渲染下三线性/各向异性都很贵；2 倍超采样缩小后看不出 mip 分界）
+  const groundTex = (tex) => { tex.colorSpace = THREE.SRGBColorSpace; tex.anisotropy = 1; tex.minFilter = THREE.LinearMipmapNearestFilter; return tex; };
+
+  // ---------- 共用 GLSL：天空色（天空球、反射、雾共用，远景和雾无缝衔接）+ 顶点光照 ----------
+  const sunDir = new THREE.Vector3(Math.sin(SUN_AZ), 0, Math.cos(SUN_AZ));
+  const keyDir = new THREE.Vector3(sunDir.x, 0.35, sunDir.z).normalize();
+  const moonDir = new THREE.Vector3(-sunDir.x * 0.6, 0.8, -sunDir.z * 0.6).normalize();
+  const vecStr = (v) => `vec3(${v.x.toFixed(4)}, ${v.y.toFixed(4)}, ${v.z.toFixed(4)})`;
+  const COMMON_GLSL = `
+    vec3 skyCol(vec3 d) {
+      float y = d.y;
+      vec2 hz = normalize(d.xz + 1e-5);
+      float s = max(dot(hz, vec2(${sunDir.x.toFixed(4)}, ${sunDir.z.toFixed(4)})), 0.0); s *= s; s *= s;
+      vec3 c = mix(${v3(SKY.horizon)}, ${v3(SKY.zenith)}, sqrt(clamp(y, 0.0, 1.0)));
+      c += ${v3(SKY.glow)} * (0.03 + 0.5 * s) * exp(-max(y, 0.0) * 14.0);
+      vec3 below = ${v3(SKY.below)} + ${v3(SKY.glow, 0.05)} * (0.2 + 0.8 * s);
+      return mix(c, below, clamp(-y * 5.0, 0.0, 1.0));
+    }
+    // 便宜的色调映射：有理曲线拟合 three 的 ACES + sRGB（输出已是显示空间），曝光直接乘进去
+    vec3 filmic(vec3 c) {
+      vec3 x = max(c * ${(EXPOSURE / 1.1).toFixed(4)} - 0.00258, 0.0);
+      return (x * (2.8398 * x + 1.8290)) / (x * (2.8398 * x + 2.0055) + 0.33947);
+    }
+    // 便宜的直接光：半球天光 + 落日暖色主光 + 冷色月光（法线为世界空间）
+    vec3 lightAt(vec3 n) {
+      vec3 c = mix(vec3(0.09, 0.065, 0.06), vec3(0.13, 0.17, 0.30), 0.5 + 0.5 * n.y);
+      c += vec3(0.75, 0.42, 0.25) * max(dot(n, ${vecStr(keyDir)}), 0.0);
+      c += vec3(0.12, 0.17, 0.30) * max(dot(n, ${vecStr(moonDir)}), 0.0);
+      return c;
+    }`;
+  // 全局替换雾：逐顶点算（便宜），按视线方向取天空色，并随高度衰减（低处雾浓）
+  THREE.ShaderChunk.fog_pars_vertex = `#ifdef USE_FOG
+    varying vec3 vFogC; varying float vFogF; uniform float fogDensity;
+    #ifndef COMMON_GLSL
+    #define COMMON_GLSL
+    ${COMMON_GLSL}
+    #endif
+  #endif`;
+  THREE.ShaderChunk.fog_vertex = `#ifdef USE_FOG
+    vec3 fDir = normalize((vec4(mvPosition.xyz, 0.0) * viewMatrix).xyz);
+    float fDist = length(mvPosition.xyz);
+    float fH = max(0.0, cameraPosition.y + fDir.y * fDist * 0.5);
+    float fDens = fogDensity * (0.3 + 0.7 * exp(-fH / ${FOG_HEIGHT.toFixed(1)}));
+    vFogF = 1.0 - exp(-fDens * fDens * fDist * fDist);
+    vFogC = filmic(skyCol(fDir));                  // 雾色直接在顶点里做完色调映射（片元只剩一次 mix）
+    vFogF = max(vFogF, smoothstep(${(FAR_FOG * 0.6).toFixed(1)}, ${FAR_FOG.toFixed(1)}, fDist));   // 远处彻底没入雾里，和天际线底部无缝衔接
+  #endif`;
+  THREE.ShaderChunk.fog_pars_fragment = '#ifdef USE_FOG\n varying vec3 vFogC; varying float vFogF;\n#endif';
+  // three 在色调映射之后才混雾：雾色已在顶点里映射好
+  THREE.ShaderChunk.fog_fragment = '#ifdef USE_FOG\n gl_FragColor.rgb = mix(gl_FragColor.rgb, vFogC, vFogF);\n#endif';
+  const scrimU = { value: 0 };
+  // 全局换掉色调映射：ACES 两次矩阵 + sRGB 的三个 pow 在软件光栅里很贵，这条曲线结果几乎一样（灰阶误差 < 0.5%）
+  THREE.ShaderChunk.tonemapping_fragment = `#if defined( TONE_MAPPING )
+    { vec3 x = max(gl_FragColor.rgb * ${(EXPOSURE / 1.1).toFixed(4)} - 0.00258, 0.0);
+      gl_FragColor.rgb = (x * (2.8398 * x + 1.8290)) / (x * (2.8398 * x + 2.0055) + 0.33947); }
+  #endif`;
+  THREE.ShaderChunk.colorspace_fragment = '#ifndef TONE_MAPPING\n gl_FragColor = linearToOutputTexel( gl_FragColor );\n#endif';
+  // 给 MeshBasicMaterial 注入自定义着色：顶点部分可用 COMMON_GLSL，片元里用 outgoingLight 覆盖颜色
+  const customize = (mat, { vDecl = '', vMain = '', fDecl = '', fMain = '' }, uniforms = {}, extra = null) => {
+    const key = vDecl + vMain + fDecl + fMain;
+    mat.customProgramCacheKey = () => key;   // 同样代码的材质共用一个着色器程序（编译很慢，越少越好）
+    mat.onBeforeCompile = (sh) => {
+      Object.assign(sh.uniforms, uniforms);
+      sh.vertexShader = sh.vertexShader
+        .replace('#include <common>', `#include <common>\n#ifndef COMMON_GLSL\n#define COMMON_GLSL\n${COMMON_GLSL}\n#endif\n${vDecl}`)
+        .replace('#include <fog_vertex>', `#include <fog_vertex>\n${vMain}`);
+      sh.fragmentShader = sh.fragmentShader
+        .replace('#include <common>', `#include <common>\nfloat h12(vec2 p){ vec3 p3 = fract(vec3(p.xyx) * .1031); p3 += dot(p3, p3.yzx + 33.33); return fract((p3.x + p3.y) * p3.z); }\nfloat boxAA(float x, float a, float b, float w){ return clamp((x - a) / w + 0.5, 0.0, 1.0) * clamp((b - x) / w + 0.5, 0.0, 1.0); }\n${fDecl}`)
+        .replace('vec3 outgoingLight = reflectedLight.indirectDiffuse;', `vec3 outgoingLight = reflectedLight.indirectDiffuse;\n${fMain}`)
+        .replace('#include <envmap_fragment>', '');
+      if (extra) extra(sh);
+    };
+    return mat;
+  };
+
+  // 景深感：uFocus 随推近从 0 升到 FOCUS_BLUR；离相机越远的贴图采样越模糊（mip 偏移，几乎零成本）、楼窗越早平均成一片
+  const focusU = { value: 0 };
+  const FOCUS_GLSL = 'uniform float uFocus; float focusAt(float d){ return uFocus * smoothstep(70.0, 220.0, d); }';
+  // 给带贴图的普通材质加景深：k 是模糊强度系数
+  const blurMap = (mat, k) => customize(mat, {
+    vDecl: `${FOCUS_GLSL} varying float vBlur;`, vMain: `vBlur = focusAt(length(mvPosition.xyz)) * ${k.toFixed(2)};`,
+    fDecl: 'varying float vBlur;', fMain: '' }, { uFocus: focusU }, (sh) => {
+    sh.fragmentShader = sh.fragmentShader.replace('texture2D( map, vMapUv )', 'texture2D( map, vMapUv, vBlur )'); });
+
+  // 只受顶点光照的简单材质（金属、石材、树）
+  const litMat = (color) => customize(new THREE.MeshBasicMaterial({ color }), {
+    vDecl: 'varying vec3 vLit;', vMain: 'vLit = lightAt(normalize(mat3(modelMatrix) * normal));',
+    fDecl: 'varying vec3 vLit;', fMain: 'outgoingLight = diffuseColor.rgb * vLit;' });
+
+  const scene = new THREE.Scene();
+
+  window.__three = { renderer, scene };                          // 让系统统计三角形数和贴图数
+  scene.fog = new THREE.FogExp2(0x000000, FOG_DENSITY);
+
+  // 天空球：最后画（只着色没被挡住的像素）；天空色连同色调映射都逐顶点算，片元零成本
+  const skyMat = new THREE.ShaderMaterial({
+    side: THREE.DoubleSide, depthWrite: false, fog: false, toneMapped: false,
+    vertexShader: `varying vec3 vSky; uniform float uBoost; uniform float uTM; ${COMMON_GLSL}
+      void main(){ vec3 c = skyCol(normalize(position)) * uBoost; vSky = uTM > 0.5 ? filmic(c) : c; gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0); }`,
+    fragmentShader: `varying vec3 vSky; void main(){ gl_FragColor = vec4(vSky, 1.0); }`,
+    uniforms: { uBoost: { value: 1 }, uTM: { value: 1 } },
+  });
+  // 经纬球，但纬线集中在地平线附近：地平线那条暖光带变化很快，顶点太稀会插值出一道硬边
+  const skyGeo = (() => {
+    const R = 900, LON = 64, LAT = 48, pos = [], idx = [];
+    for (let j = 0; j <= LAT; j++) {
+      const s = j / LAT * 2 - 1, el = Math.sign(s) * Math.pow(Math.abs(s), 2.2) * Math.PI / 2;
+      for (let i = 0; i <= LON; i++) { const a = i / LON * Math.PI * 2; pos.push(Math.cos(el) * Math.cos(a) * R, Math.sin(el) * R, Math.cos(el) * Math.sin(a) * R); }
+    }
+    for (let j = 0; j < LAT; j++) for (let i = 0; i < LON; i++) { const p = j * (LON + 1) + i, q = p + LON + 1; idx.push(p, p + 1, q, p + 1, q + 1, q); }
+    const g = new THREE.BufferGeometry(); g.setAttribute('position', new THREE.Float32BufferAttribute(pos, 3)); g.setIndex(idx); return g;
+  })();
+  const sky = new THREE.Mesh(skyGeo, skyMat);
+  sky.renderOrder = 10; scene.add(sky);
+
+  // ---------- 环境反射：天空 + 地平线下一圈城市灯光条 + 一道竖向柔光带，烘成立方体贴图给玻璃塔做镜面反射 ----------
+  const cubeRT = new THREE.WebGLCubeRenderTarget(256, { type: THREE.HalfFloatType });
+  {
+    const envScene = new THREE.Scene();
+    const envSky = skyMat.clone(); envSky.uniforms.uBoost.value = 1.1; envSky.uniforms.uTM.value = 0;   // 立方体贴图里存线性色
+    envScene.add(new THREE.Mesh(new THREE.SphereGeometry(50, 32, 16), envSky));
+    const warm = new THREE.MeshBasicMaterial({ color: new THREE.Color(1.5, 0.9, 0.5), toneMapped: false, side: THREE.DoubleSide });
+    const cool = new THREE.MeshBasicMaterial({ color: new THREE.Color(0.5, 0.8, 1.3), toneMapped: false, side: THREE.DoubleSide });
+    const dark = new THREE.MeshBasicMaterial({ color: new THREE.Color(0.02, 0.025, 0.05), toneMapped: false, side: THREE.DoubleSide });
+    for (let k = 0; k < 60; k++) {   // 远处楼群剪影 + 零星亮窗
+      const a = (k / 60) * Math.PI * 2 + rand() * 0.05, h = 2 + rand() * 9;
+      const p = new THREE.Mesh(new THREE.PlaneGeometry(2 + rand() * 3, h), dark);
+      p.position.set(Math.sin(a) * 30, -2 + h / 2, Math.cos(a) * 30); p.lookAt(0, p.position.y, 0); envScene.add(p);
+      if (rand() < 0.6) {
+        const l = new THREE.Mesh(new THREE.PlaneGeometry(0.3 + rand() * 1.2, 0.2 + rand() * 0.4), rand() < 0.8 ? warm : cool);
+        l.position.set(Math.sin(a) * 29.8, -1 + rand() * h * 0.8, Math.cos(a) * 29.8); l.lookAt(0, l.position.y, 0); envScene.add(l);
+      }
+    }
+    const sc = document.createElement('canvas'); sc.width = 64; sc.height = 4;   // 横向渐隐的宽柔光带
+    { const g = sc.getContext('2d'), gr = g.createLinearGradient(0, 0, 64, 0); gr.addColorStop(0, 'rgba(0,0,0,0)'); gr.addColorStop(0.5, 'rgba(255,255,255,1)'); gr.addColorStop(1, 'rgba(0,0,0,0)'); g.fillStyle = gr; g.fillRect(0, 0, 64, 4); }
+    const streak = new THREE.Mesh(new THREE.PlaneGeometry(16, 60), new THREE.MeshBasicMaterial({ map: new THREE.CanvasTexture(sc), color: new THREE.Color(0.5, 0.4, 0.32), transparent: true, blending: THREE.AdditiveBlending, toneMapped: false, side: THREE.DoubleSide }));
+    streak.position.set(Math.sin(SUN_AZ + 2.4) * 30, 10, Math.cos(SUN_AZ + 2.4) * 30); streak.lookAt(0, 10, 0); envScene.add(streak);
+    new THREE.CubeCamera(0.1, 100, cubeRT).update(renderer, envScene);
+  }
+
+  // ---------- 城市布局（种子随机） ----------
+  const C = (CITY_N - 1) / 2;
+  const isRoad = (i) => i % 6 === C % 6;              // 每 6 格一条大道，正中那条（i = C）就是中轴线
+  const EXTENT = (CITY_N / 2) * STEP;                 // 城市半宽
+  const bList = [];                                   // 每栋楼：x, z, w, d, h, type, lit, tone
+  for (let i = 0; i < CITY_N; i++) for (let j = 0; j < CITY_N; j++) {
+    if (isRoad(i) || isRoad(j)) continue;
+    const x = (i - C) * STEP, z = (j - C) * STEP, d = Math.hypot(x, z);
+    if (d < PLAZA_R + 1.5) continue;
+    if (rand() < smooth(EXTENT * 0.55, EXTENT, d) * 0.55) continue;            // 外围变稀
+    const h = (1.4 + rand() * 3.4) * (1 + 2.4 * Math.exp(-d * d / 650)) * (rand() < 0.08 ? 1.9 : 1) * (1 - 0.45 * smooth(25, EXTENT, d));
+    const w = 1.5 + rand() * 1.1, dd = 1.5 + rand() * 1.1;
+    const r = rand();
+    const type = h > 9 ? (r < 0.55 ? 2 : 1) : (r < 0.7 ? 0 : 1);              // 0 方格窗 1 横向带窗 2 玻璃幕墙
+    bList.push({ x: x + (rand() - 0.5) * 0.5, z: z + (rand() - 0.5) * 0.5, w, d: dd, h, type, lit: WINDOW_LIT * (0.4 + rand() * 1.1), tone: rand() });
+  }
+
+  // ---------- 楼群：一个 InstancedMesh（1 次 draw call）+ 着色器里程序化生成窗户 ----------
+  // 每个实例带 aStyle = (种子, 亮灯比例, 类型, 是否有窗)；窗户网格按真实尺寸铺。
+  // 亮灯按“楼层 × 区段”成片（像办公楼整层亮着），所以中远处读成一条条横向灯带而不是噪点；
+  // 窗列小于约 1.5 像素时先横向平均成灯带，窗行也太小时再整体平均（防闪烁）
+  const boxGeo = new THREE.BoxGeometry(1, 1, 1).translate(0, 0.5, 0);
+  const parts = [];   // 楼体 + 退台 + 屋顶设备 + 天线
+  const reds = [];    // 航空障碍灯
+  const crowns = [];  // 屋顶灯带
+  for (const b of bList) {
+    parts.push({ x: b.x, y: 0, z: b.z, w: b.w, h: b.h, d: b.d, type: b.type, lit: b.lit, tone: b.tone, win: 1 });
+    let top = b.h, tw = b.w, td = b.d;
+    if (b.h > 7 && rand() < 0.65) {                         // 退台
+      tw = b.w * (0.62 + rand() * 0.15); td = b.d * (0.62 + rand() * 0.15);
+      const h2 = b.h * (0.12 + rand() * 0.18);
+      parts.push({ x: b.x, y: top, z: b.z, w: tw, h: h2, d: td, type: b.type, lit: b.lit, tone: b.tone, win: 1 });
+      top += h2;
+    }
+    if (rand() < 0.7) {                                     // 屋顶设备
+      const mw = tw * (0.25 + rand() * 0.3), md = td * (0.25 + rand() * 0.3);
+      parts.push({ x: b.x + (rand() - 0.5) * (tw - mw) * 0.7, y: top, z: b.z + (rand() - 0.5) * (td - md) * 0.7, w: mw, h: 0.25 + rand() * 0.35, d: md, type: 3, lit: 0, tone: b.tone, win: 0 });
+    }
+    if (top > 13 && rand() < 0.6) {                         // 天线 + 红灯
+      const ah = 1.5 + rand() * 2.5;
+      parts.push({ x: b.x, y: top, z: b.z, w: 0.08, h: ah, d: 0.08, type: 3, lit: 0, tone: 0.2, win: 0 });
+      reds.push([b.x, top + ah, b.z]);
+    } else if (top > 6 && rand() < 0.3) crowns.push([b.x, b.h, b.z, b.w, b.d]);
+  }
+  const blds = new THREE.InstancedMesh(boxGeo, null, parts.length);
+  {
+    const m = new THREE.Matrix4(), q = new THREE.Quaternion(), s = new THREE.Vector3(), p = new THREE.Vector3(), c = new THREE.Color();
+    const style = new Float32Array(parts.length * 4);
+    parts.forEach((b, k) => {
+      blds.setMatrixAt(k, m.compose(p.set(b.x, b.y, b.z), q, s.set(b.w, b.h, b.d)));
+      if (b.type === 2) c.setHSL(0.6 + b.tone * 0.03, 0.3, 0.07 + b.tone * 0.05);           // 深色玻璃
+      else if (b.type === 3) c.setHSL(0.6, 0.06, 0.18 + b.tone * 0.1);                        // 设备 / 天线
+      else c.setHSL(b.tone < 0.3 ? 0.08 : 0.56 + b.tone * 0.06, 0.06 + b.tone * 0.05, 0.16 + b.tone * 0.1);   // 混凝土 / 石材：多数偏冷灰，少数暖灰
+      blds.setColorAt(k, c);
+      style.set([rand() * 100, b.lit, b.type, b.win], k * 4);
+    });
+    boxGeo.setAttribute('aStyle', new THREE.InstancedBufferAttribute(style, 4));
+  }
+  blds.material = customize(new THREE.MeshBasicMaterial({ color: 0xffffff }), {
+    vDecl: `attribute vec4 aStyle; varying vec4 vStyle; varying vec3 vLoc; varying vec3 vScl; varying vec3 vObjN; varying vec3 vLit; varying vec3 vRefl; varying float vBlur; ${FOCUS_GLSL}`,
+    vMain: `vBlur = focusAt(length(mvPosition.xyz));
+      vScl = vec3(length(instanceMatrix[0].xyz), length(instanceMatrix[1].xyz), length(instanceMatrix[2].xyz));
+      vLoc = position * vScl; vObjN = normal; vStyle = aStyle;
+      vec3 wp = (modelMatrix * instanceMatrix * vec4(position, 1.0)).xyz;
+      vec3 vd = normalize(wp - cameraPosition);
+      vLit = lightAt(normal);
+      float fres = 0.06 + 0.94 * pow(1.0 - max(dot(-vd, normal), 0.0), 4.0);
+      vRefl = skyCol(reflect(vd, normal)) * fres * 1.6;`,
+    fDecl: 'varying vec4 vStyle; varying vec3 vLoc; varying vec3 vScl; varying vec3 vObjN; varying vec3 vLit; varying vec3 vRefl; varying float vBlur;',
+    fMain: `{
+      float side = 1.0 - step(0.5, abs(vObjN.y));
+      float type = vStyle.z;
+      vec2 fc = abs(vObjN.x) > 0.5 ? vec2(vLoc.z + vScl.z * 0.5, vLoc.y) : vec2(vLoc.x + vScl.x * 0.5, vLoc.y);
+      vec2 cellSz = type < 0.5 ? vec2(0.42, 0.36) : (type < 1.5 ? vec2(0.9, 0.36) : vec2(0.3, 0.34));
+      vec2 g = fc / cellSz; vec2 id = floor(g); vec2 f = fract(g); vec2 fw = fwidth(g) + 1e-4;
+      float farX = clamp(smoothstep(0.3, 0.65, fw.x) + vBlur, 0.0, 1.0);   // 窗列太细 → 横向平均成灯带
+      float far = clamp(smoothstep(0.35, 0.8, fw.y) + vBlur * 0.7, 0.0, 1.0);  // 窗行也太细 → 整面平均
+      float wx = mix(type < 0.5 ? boxAA(f.x, 0.2, 0.8, fw.x) : boxAA(f.x, 0.05, 0.95, fw.x), type < 0.5 ? 0.6 : 0.9, farX);
+      float wy = mix(type < 1.5 ? boxAA(f.y, 0.25, 0.8, fw.y) : boxAA(f.y, 0.1, 0.9, fw.y), type < 1.5 ? 0.55 : 0.8, far);
+      float win = wx * wy * vStyle.w * side;
+      win *= step(0.5, fc.y) * step(fc.y, vScl.y - 0.22);              // 底层和女儿墙不开窗
+      float faceSeed = vStyle.x + vObjN.x * 7.0 + vObjN.z * 13.0;
+      float floorOn = step(1.0 - vStyle.y * 1.35, h12(vec2(floor(id.y / 2.0), faceSeed)));   // 两层一组整层亮 / 暗
+      float zone = h12(vec2(floor(id.x / 5.0), id.y + faceSeed));      // 同层里按 5 扇窗一段，少数段关灯
+      float litP = mix(mix(floorOn * step(0.28, zone), floorOn * 0.72, farX), vStyle.y, far);
+      vec3 tint = mix(mix(vec3(1.0, 0.6, 0.28), vec3(1.0, 0.8, 0.55), zone), vec3(0.6, 0.8, 1.0), step(0.86, fract(zone * 7.31)));
+      vec3 glow = win * litP * tint * (0.5 + 0.5 * zone);
+      // 墙面：顶点光照 + 底部接地暗角 + 街道暖光往上打 + 屋顶边缘亮线
+      float ao = mix(0.3, 1.0, smoothstep(0.0, 2.0, vLoc.y + (1.0 - side) * 3.0));
+      float roofEdge = (1.0 - side) * (1.0 - smoothstep(0.04, 0.14, min(vScl.x * 0.5 - abs(vLoc.x), vScl.z * 0.5 - abs(vLoc.z))));
+      vec3 wall = diffuseColor.rgb * (vLit * ao * 0.75 + vec3(0.5, 0.3, 0.15) * exp(-vLoc.y * 0.9) * side) * (1.0 + roofEdge * 1.2) * mix(1.0, 0.35, (1.0 - side) * (1.0 - roofEdge));
+      float glass = max(win, step(1.5, type) * step(type, 2.5) * side * 0.8);
+      vec3 glassC = diffuseColor.rgb * 0.15 + vRefl * (type > 1.5 ? 0.8 : 0.45);
+      outgoingLight = mix(wall, glassC, glass) + glow;
+    }`,
+  });
+  scene.add(blds);
+
+  // 屋顶灯带、航空障碍灯：InstancedMesh + 高亮颜色
+  const glowMat = new THREE.MeshBasicMaterial({ color: 0xffffff });
+  const crownMesh = new THREE.InstancedMesh(new THREE.BoxGeometry(1, 1, 1), glowMat, Math.max(1, crowns.length));
+  {
+    const m = new THREE.Matrix4(), c = new THREE.Color();
+    crowns.forEach(([x, h, z, w, d], k) => {
+      crownMesh.setMatrixAt(k, m.makeScale(w * 1.03, 0.1, d * 1.03).setPosition(x, h - 0.14, z));
+      crownMesh.setColorAt(k, rand() < 0.5 ? c.setRGB(0.5, 1.8, 2.4) : c.setRGB(2.4, 1.3, 0.5));
+    });
+    crownMesh.count = crowns.length;
+  }
+  reds.push([0, TOWER_H + 11.1, 0, 1.8]);   // 最后一个是塔尖航空灯（放大）
+  const redMesh = new THREE.InstancedMesh(new THREE.SphereGeometry(0.16, 6, 4), new THREE.MeshBasicMaterial({ color: 0xffffff }), reds.length);
+  reds.forEach(([x, y, z, sc = 1], k) => { redMesh.setMatrixAt(k, new THREE.Matrix4().makeScale(sc, sc, sc).setPosition(x, y, z)); redMesh.setColorAt(k, new THREE.Color(0, 0, 0)); });
+  scene.add(crownMesh, redMesh);
+
+  // ---------- 地面：一张程序化贴图（街区、大道路灯、楼底接触阴影、广场铺装都烘在里面）----------
+  const GROUND = EXTENT * 2 + 8, GPX = 2048, ppu = GPX / GROUND;
+  const toPx = (v) => (v + GROUND / 2) * ppu;
+  const gCan = document.createElement('canvas'); gCan.width = gCan.height = GPX;
+  {
+    const g = gCan.getContext('2d');
+    g.fillStyle = '#07090e'; g.fillRect(0, 0, GPX, GPX);
+    // 街区人行道（略亮）
+    for (let i = 0; i < CITY_N; i++) for (let j = 0; j < CITY_N; j++) {
+      if (isRoad(i) || isRoad(j)) continue;
+      const x = (i - C) * STEP, z = (j - C) * STEP;
+      g.fillStyle = (i * 7 + j * 3) % 4 ? '#12161f' : '#0f131b';
+      g.fillRect(toPx(x - STEP * 0.47), toPx(z - STEP * 0.47), STEP * 0.94 * ppu, STEP * 0.94 * ppu);
+    }
+    // 楼底接触阴影：先画在小画布上，整体模糊一次再叠上去
+    const ao = document.createElement('canvas'); ao.width = ao.height = GPX / 4;
+    const a = ao.getContext('2d'); a.fillStyle = '#000';
+    for (const b of bList) a.fillRect((toPx(b.x - b.w / 2) - 6) / 4, (toPx(b.z - b.d / 2) - 6) / 4, (b.w * ppu + 12) / 4, (b.d * ppu + 12) / 4);
+    g.globalAlpha = 0.85; g.filter = 'blur(6px)'; g.drawImage(ao, 0, 0, GPX, GPX); g.filter = 'none'; g.globalAlpha = 1;
+    // 大道：车道线 + 两侧路灯（直接画亮色，叠加模式）
+    const dots = [];
+    for (let i = 0; i < CITY_N; i++) {
+      if (!isRoad(i)) continue;
+      const v = (i - C) * STEP, axis = i === C;
+      for (const vert of [true, false]) {
+        const lineAt = (o, col, wpx, dash) => { g.strokeStyle = col; g.lineWidth = wpx; g.setLineDash(dash); g.beginPath();
+          if (vert) { g.moveTo(toPx(v + o), 0); g.lineTo(toPx(v + o), GPX); } else { g.moveTo(0, toPx(v + o)); g.lineTo(GPX, toPx(v + o)); } g.stroke(); };
+        lineAt(0, axis ? '#6a5534' : '#3a3226', axis ? 3 : 1.5, axis ? [] : [10, 10]);
+        lineAt(-1.1, '#222733', 1.5, []); lineAt(1.1, '#222733', 1.5, []);
+        for (let s = -GROUND / 2; s < GROUND / 2; s += axis ? 1.0 : 1.6) for (const o of axis ? [-1.35, -0.5, 0.5, 1.35] : [-1.25, 1.25])
+          dots.push([vert ? toPx(v + o) : toPx(s), vert ? toPx(s) : toPx(v + o), axis]);
+      }
+    }
+    g.setLineDash([]);
+    g.globalCompositeOperation = 'lighter';
+    // 路面上的暖色光晕带（路灯照亮路面）
+    for (let i = 0; i < CITY_N; i++) {
+      if (!isRoad(i)) continue;
+      const v = (i - C) * STEP, axis = i === C, wpx = STEP * 0.9 * ppu;
+      g.fillStyle = axis ? 'rgba(120,70,30,0.35)' : 'rgba(90,50,22,0.28)';
+      g.fillRect(toPx(v) - wpx / 2, 0, wpx, GPX); g.fillRect(0, toPx(v) - wpx / 2, GPX, wpx);
+    }
+    for (const [px, py, axis] of dots) {
+      const r = axis ? 7 : 5, gr = g.createRadialGradient(px, py, 0, px, py, r);
+      gr.addColorStop(0, axis ? 'rgba(255,220,160,1)' : 'rgba(255,170,90,0.95)'); gr.addColorStop(0.35, 'rgba(255,150,70,0.35)'); gr.addColorStop(1, 'rgba(255,140,60,0)');
+      g.fillStyle = gr; g.fillRect(px - r, py - r, r * 2, r * 2);
+    }
+    g.globalCompositeOperation = 'source-over';
+    // 中心广场：同心圆铺装 + 灯环
+    const cx = toPx(0), cr = PLAZA_R * ppu;
+    const pg = g.createRadialGradient(cx, cx, 0, cx, cx, cr);
+    pg.addColorStop(0, '#3a3f4c'); pg.addColorStop(0.7, '#232836'); pg.addColorStop(1, '#1a1e29');
+    g.fillStyle = pg; g.beginPath(); g.arc(cx, cx, cr, 0, Math.PI * 2); g.fill();
+    g.strokeStyle = 'rgba(140,150,170,0.28)'; g.lineWidth = 1.5;
+    for (let k = 1; k < 9; k++) { g.beginPath(); g.arc(cx, cx, cr * k / 9, 0, Math.PI * 2); g.stroke(); }
+    for (let k = 0; k < 48; k++) { const an = k / 48 * Math.PI * 2; g.beginPath(); g.moveTo(cx + Math.cos(an) * cr * 0.55, cx + Math.sin(an) * cr * 0.55); g.lineTo(cx + Math.cos(an) * cr, cx + Math.sin(an) * cr); g.stroke(); }
+    g.strokeStyle = 'rgba(120,230,255,0.95)'; g.lineWidth = 5; g.beginPath(); g.arc(cx, cx, cr * 0.985, 0, Math.PI * 2); g.stroke();
+    g.globalCompositeOperation = 'lighter';
+    for (let k = 0; k < 64; k++) { const an = k / 64 * Math.PI * 2, r = cr * 0.9, px = cx + Math.cos(an) * r, py = cx + Math.sin(an) * r;
+      const gr = g.createRadialGradient(px, py, 0, px, py, 9); gr.addColorStop(0, 'rgba(255,225,170,1)'); gr.addColorStop(1, 'rgba(255,200,120,0)'); g.fillStyle = gr; g.fillRect(px - 9, py - 9, 18, 18); }
+    const tg = g.createRadialGradient(cx, cx, 0, cx, cx, cr * 0.75);  // 塔底泛光
+    tg.addColorStop(0, 'rgba(120,200,255,0.25)'); tg.addColorStop(1, 'rgba(120,200,255,0)'); g.fillStyle = tg; g.fillRect(cx - cr, cx - cr, cr * 2, cr * 2);
+    g.globalCompositeOperation = 'source-over';
+  }
+  const gTex = groundTex(new THREE.CanvasTexture(gCan));
+  const ground = new THREE.Mesh(new THREE.PlaneGeometry(GROUND, GROUND, 40, 40),
+    blurMap(new THREE.MeshBasicMaterial({ map: gTex, color: new THREE.Color(1.5, 1.5, 1.5), polygonOffset: true, polygonOffsetFactor: -2, polygonOffsetUnits: -2 }), 0.8));
+  ground.rotation.x = -Math.PI / 2; ground.renderOrder = 5; scene.add(ground);
+
+  // 外围“灯毯”：一张重复贴图铺到地平线，让城市一直延伸进雾里
+  {
+    const cv = document.createElement('canvas'); cv.width = cv.height = 512;
+    const g = cv.getContext('2d'); const r2 = mulberry32(SEED + 7);
+    g.fillStyle = '#080a10'; g.fillRect(0, 0, 512, 512);
+    for (let k = 0; k < 70; k++) { g.fillStyle = `rgba(20,24,34,${0.6 + r2() * 0.4})`; g.fillRect(r2() * 512, r2() * 512, 20 + r2() * 50, 20 + r2() * 50); }
+    for (let k = 0; k < 1100; k++) { g.fillStyle = `rgba(${200 + r2() * 55 | 0},${140 + r2() * 80 | 0},${80 + r2() * 90 | 0},${0.2 + r2() * 0.6})`; g.fillRect(r2() * 512, r2() * 512, 1.5 + r2() * 2, 1.5 + r2() * 2); }
+    g.strokeStyle = 'rgba(255,165,85,0.32)'; g.lineWidth = 2.5;
+    g.beginPath(); for (let k = 0; k < 3; k++) { const o = 40 + r2() * 430; g.moveTo(o, 0); g.lineTo(o + r2() * 60 - 30, 512); const o2 = 40 + r2() * 430; g.moveTo(0, o2); g.lineTo(512, o2 + r2() * 60 - 30); } g.stroke();
+    g.strokeStyle = 'rgba(255,165,85,0.1)'; g.lineWidth = 1.2;
+    g.beginPath(); for (let k = 0; k < 10; k++) { const o = r2() * 512; g.moveTo(o, 0); g.lineTo(o, 512); const o2 = r2() * 512; g.moveTo(0, o2); g.lineTo(512, o2); } g.stroke();
+    const tex = groundTex(new THREE.CanvasTexture(cv)); tex.wrapS = tex.wrapT = THREE.RepeatWrapping; tex.repeat.set(17, 17);
+    // 只铺到雾线外一点：再远处已经完全没入雾里，画了也看不见，白费填充
+    const outer = new THREE.Mesh(new THREE.RingGeometry(EXTENT - 2, FAR_FOG + 30, 72, 12), blurMap(new THREE.MeshBasicMaterial({ map: tex, color: new THREE.Color(1.6, 1.6, 1.6) }), 1.0));
+    outer.rotation.x = -Math.PI / 2; outer.position.y = -0.05; outer.renderOrder = 6; scene.add(outer);
+  }
+
+  // 远景天际线：两圈带剪影贴图的圆筒，立在雾线上。近圈暗、远圈更淡（空气透视）；颜色取自该方向的天空色，
+  // 下半截渐隐成雾色（没有硬底边），楼顶有退台、尖顶、斜顶、天线；推近时随景深变柔
+  for (const [rad, hgt, dark, hazeH, seed] of [[FAR_FOG + 140, 60, 0.86, 0.4, 21], [FAR_FOG + 40, 46, 0.72, 0.3, 9]]) {
+    const cv = document.createElement('canvas'); cv.width = 2048; cv.height = 256;
+    const g = cv.getContext('2d'); const r2 = mulberry32(SEED + seed);
+    const roof = (x, top, bw) => {                     // 楼顶造型
+      const k = r2();
+      if (k < 0.14) { g.beginPath(); g.moveTo(x, top); g.lineTo(x + bw / 2, top - bw * (0.8 + r2())); g.lineTo(x + bw, top); g.fill(); }   // 尖顶
+      else if (k < 0.26) { g.beginPath(); g.moveTo(x, top); g.lineTo(x + bw, top - bw * 0.5); g.lineTo(x + bw, top); g.fill(); }          // 斜顶
+      else if (k < 0.36) { g.beginPath(); g.arc(x + bw / 2, top, bw / 2, Math.PI, 0); g.fill(); }                                          // 穹顶
+      else if (k < 0.6) g.fillRect(x + bw / 2 - 0.7, top - 10 - r2() * 18, 1.4, 12 + r2() * 18);                                           // 天线
+    };
+    let x = 0;
+    while (x < 2048) {
+      const cluster = 0.45 + 0.55 * Math.pow(0.5 + 0.5 * Math.sin(x / 2048 * Math.PI * 2 * 2 + seed), 2);   // 成簇的“市中心”
+      const bw = 10 + r2() * 34, bh = (18 + Math.pow(r2(), 2.0) * 190) * cluster;
+      g.fillStyle = '#000';
+      let top = 256 - bh;
+      g.fillRect(x, top, bw, bh);
+      if (bh > 70 && r2() < 0.55) {                    // 退台：上面再叠一两段更窄的
+        for (let n = 0, w = bw; n < 1 + (r2() < 0.4 ? 1 : 0); n++) { const w2 = w * (0.55 + r2() * 0.2), h2 = 10 + r2() * 30; g.fillRect(x + (bw - w2) / 2, top - h2, w2, h2); top -= h2; w = w2; }
+        roof(x + bw * 0.35, top, bw * 0.3);
+      } else roof(x, top, bw);
+      g.fillStyle = 'rgba(255,0,0,0.75)';              // 亮窗写在 R 通道：按楼层成排，稀疏、细
+      for (let yy = 256 - bh + 6; yy < 250; yy += 4) if (r2() < 0.3) { const x0 = x + 2 + r2() * (bw - 6); g.fillRect(x0, yy, 2 + r2() * Math.min(8, bw - 4 - (x0 - x)), 1); }
+      x += bw + (r2() < 0.25 ? 4 + r2() * 14 : r2() * 3);
+    }
+    const tex = new THREE.CanvasTexture(cv); tex.wrapS = THREE.RepeatWrapping; tex.repeat.x = 3; tex.minFilter = THREE.LinearMipmapNearestFilter;
+    const ring = new THREE.Mesh(new THREE.CylinderGeometry(rad, rad, hgt, 96, 1, true), customize(
+      new THREE.MeshBasicMaterial({ map: tex, side: THREE.BackSide, transparent: true, depthWrite: false, fog: false }), {
+        vDecl: `${FOCUS_GLSL} varying vec3 vSkyC; varying float vBlur;`,
+        vMain: `vSkyC = skyCol(normalize((modelMatrix * vec4(position, 1.0)).xyz - cameraPosition)); vBlur = uFocus * 1.3;`,
+        fDecl: 'varying vec3 vSkyC; varying float vBlur;',
+        fMain: `{
+          float haze = 1.0 - smoothstep(0.02, ${hazeH.toFixed(2)}, vMapUv.y);       // 底部渐隐成雾色
+          vec3 sil = vSkyC * mix(${dark.toFixed(2)}, 1.0, haze * haze) * (0.88 + 0.3 * (1.0 - vMapUv.y));   // 楼顶略暗、往下渐亮（空气透视）
+          outgoingLight = sil + vec3(1.0, 0.62, 0.32) * diffuseColor.r * 0.4 * (1.0 - haze);
+        }` }, { uFocus: focusU }, (sh) => {
+          sh.fragmentShader = sh.fragmentShader.replace('texture2D( map, vMapUv )', 'texture2D( map, vMapUv, vBlur )'); }));
+    ring.position.y = hgt / 2 - 3; ring.renderOrder = 9; scene.add(ring);
+  }
+
+  // ---------- 中心塔楼：圆角三角截面 + 自下而上扭转收分；着色器画楼层、竖梃、室内灯光，玻璃反射立方体环境 ----------
+  const towerR = (y) => { const k = clamp(y / TOWER_H); return TOWER_R * (1 - 0.6 * Math.pow(k, 1.3)) * (1 + 0.05 * Math.sin(k * Math.PI)); };
+  const LOBE = 0.1;
+  const towerPt = (u, y, out) => {
+    const phi = u * Math.PI * 2, ang = phi + TWIST * y / TOWER_H;
+    const r = towerR(y) * (1 + LOBE * Math.cos(3 * phi)) / (1 + LOBE);
+    return out.set(Math.cos(ang) * r, y, Math.sin(ang) * r);
+  };
+  const COLS = 120;   // 竖梃数量
+  function buildTower(RS, HS) {
+    const pos = [], nor = [], fac = [], idx = [];
+    const a = new THREE.Vector3(), b = new THREE.Vector3(), c = new THREE.Vector3(), du = new THREE.Vector3(), dy = new THREE.Vector3(), n = new THREE.Vector3();
+    for (let j = 0; j <= HS; j++) {
+      const y = (j / HS) * TOWER_H;
+      for (let i = 0; i <= RS; i++) {
+        const u = i / RS;
+        towerPt(u, y, a);
+        du.subVectors(towerPt(u + 1e-3, y, b), towerPt(u - 1e-3, y, c));
+        dy.subVectors(towerPt(u, y + 1e-2, b), towerPt(u, y - 1e-2, c));
+        n.crossVectors(du, dy).normalize();
+        if (n.x * a.x + n.z * a.z < 0) n.negate();
+        pos.push(a.x, a.y, a.z); nor.push(n.x, n.y, n.z); fac.push(u * COLS, y);
+      }
+    }
+    for (let j = 0; j < HS; j++) for (let i = 0; i < RS; i++) {
+      const p = j * (RS + 1) + i, q2 = p + RS + 1;
+      idx.push(p, q2, p + 1, p + 1, q2, q2 + 1);
+    }
+    const geo = new THREE.BufferGeometry();
+    geo.setAttribute('position', new THREE.Float32BufferAttribute(pos, 3));
+    geo.setAttribute('normal', new THREE.Float32BufferAttribute(nor, 3));
+    geo.setAttribute('aFac', new THREE.Float32BufferAttribute(fac, 2));
+    geo.setIndex(idx);
+    return geo;
+  }
+  const scanU = { value: -10 };
+  const towerMat = customize(new THREE.MeshBasicMaterial({ color: 0x8090a8, envMap: cubeRT.texture }), {
+    vDecl: 'attribute vec2 aFac; varying vec2 vFac; varying vec3 vLit; varying float vFres;',
+    vMain: `vFac = aFac; vLit = lightAt(normal);
+      vec3 vd = normalize((modelMatrix * vec4(position, 1.0)).xyz - cameraPosition);
+      vFres = 0.08 + 0.92 * pow(1.0 - max(dot(-vd, normal), 0.0), 3.0);`,
+    fDecl: 'varying vec2 vFac; varying vec3 vLit; varying float vFres; uniform float uScan;',
+    fMain: `{
+      float FL = 0.55;                                            // 层高
+      vec2 g = vec2(vFac.x, vFac.y / FL); vec2 id = floor(g); vec2 f = fract(g); vec2 fw = fwidth(g) + 1e-4;
+      float far = smoothstep(0.3, 0.8, max(fw.x, fw.y));
+      float mull = mix(1.0 - smoothstep(0.06 - fw.x, 0.06 + fw.x, 0.5 - abs(f.x - 0.5)), 0.06, far);  // 竖梃
+      float span = mix(1.0 - smoothstep(0.0, fw.y * 1.5, abs(f.y - 0.1) - 0.08), 0.1, far);           // 层间横带
+      float frame = clamp(mull * 0.6 + span, 0.0, 1.0);
+      // 室内灯光：按楼层对齐。三层一组的“租户”整组亮或暗；同层按 10 列一段（一间办公区），亮的楼层里少数段关灯，
+      // 暗的楼层零星几段亮；每段亮度、色温一致，靠天花板的上沿更亮（灯槽），下半截略暗（家具剪影）
+      float tenant = floor(id.y / 3.0);
+      float floorOn = step(0.45, h12(vec2(tenant, 3.1)));
+      float hb = h12(vec2(floor(id.x / 10.0), id.y));
+      float lit = mix(step(0.94, hb), step(0.22, hb), floorOn);
+      vec3 inside = mix(vec3(1.0, 0.68, 0.36), vec3(0.72, 0.86, 1.0), step(0.72, h12(vec2(tenant, 9.7))));
+      float ceilL = 0.6 + 0.8 * smoothstep(0.55, 0.92, f.y);
+      vec3 glow = (1.0 - frame) * mix(lit * (0.2 + 0.1 * hb) * ceilL, 0.07, far) * inside * (1.0 - 0.7 * vFres);
+      glow += ${v3(ACCENT)} * 2.2 * exp(-pow((vFac.y - uScan) / 0.8, 2.0)) * (0.3 + 0.7 * span);   // 扫描光带
+      vec3 envC = textureCube(envMap, envMapRotation * vReflect).rgb;
+      vec3 glassC = vec3(0.008, 0.014, 0.032) + envC * (0.1 + vFres * 0.95);
+      vec3 frameC = diffuseColor.rgb * (vLit * 0.6 + envC * 0.25);
+      outgoingLight = mix(glassC, frameC, frame) + glow;
+    }`,
+  }, { uScan: scanU });
+  const tower = new THREE.Mesh(buildTower(96, 56), towerMat);
+  scene.add(tower);
+
+  // 塔顶：封顶 + 发光灯笼 + 一圈向内倾斜的金属细杆（透出灯笼）+ 顶环 + 塔尖（航空灯在 redMesh 里）
+  const metalMat = litMat(0x9aa6b8);
+  const topR = towerR(TOWER_H);
+  const cap = new THREE.Mesh(new THREE.CylinderGeometry(topR * 0.98, topR * 0.98, 0.4, 48), metalMat); cap.position.y = TOWER_H; scene.add(cap);
+  const lantern = new THREE.Mesh(new THREE.CylinderGeometry(topR * 0.45, topR * 0.8, 4.4, 32, 1, true), new THREE.MeshBasicMaterial({ color: new THREE.Color(1.15, 0.72, 0.38) }));
+  lantern.position.y = TOWER_H + 2.2; scene.add(lantern);
+  const crownRing = new THREE.Mesh(new THREE.TorusGeometry(topR * 0.62, 0.09, 4, 48), metalMat); crownRing.rotation.x = Math.PI / 2; crownRing.position.y = TOWER_H + 5.8; scene.add(crownRing);
+  const FINS = 20;
+  const fins = new THREE.InstancedMesh(new THREE.BoxGeometry(0.13, 9, 0.13), metalMat, FINS);
+  {
+    const m = new THREE.Matrix4(), q = new THREE.Quaternion(), e = new THREE.Euler(), v = new THREE.Vector3(), one = new THREE.Vector3(1, 1, 1);
+    for (let k = 0; k < FINS; k++) {
+      const an = (k / FINS) * Math.PI * 2, r = topR * 0.95;
+      e.set(0, -an, 0.13, 'YXZ');  // 朝内倾斜
+      fins.setMatrixAt(k, m.compose(v.set(Math.cos(an) * r, TOWER_H + 1.7, Math.sin(an) * r), q.setFromEuler(e), one));
+    }
+  }
+  scene.add(fins);
+  const spire = new THREE.Mesh(new THREE.CylinderGeometry(0.035, 0.24, 11, 10), metalMat); spire.position.y = TOWER_H + 5.5; scene.add(spire);
+
+  // 发光环：沿截面轮廓的细管，逐个点亮；外面再套一根粗一点的加法混合“光晕管”，中间亮、边缘渐隐（代替全屏泛光）
+  const rings = [], ringHalos = [];
+  const haloTubeMat = () => customize(new THREE.MeshBasicMaterial({ color: 0x000000, transparent: true, blending: THREE.AdditiveBlending, depthWrite: false, fog: false }), {
+    vDecl: 'varying float vFace;', vMain: 'vFace = abs(dot(normalize(mat3(modelMatrix) * normal), normalize(cameraPosition - (modelMatrix * vec4(position, 1.0)).xyz)));',
+    fDecl: 'varying float vFace;', fMain: 'outgoingLight = diffuseColor.rgb * vFace * vFace * vFace;' });
+  for (let k = 0; k < RING_COUNT; k++) {
+    const y = TOWER_H * (0.16 + k * (0.72 / Math.max(1, RING_COUNT - 1)));
+    const pts = []; const v = new THREE.Vector3();
+    for (let i = 0; i < 72; i++) { towerPt(i / 72, y, v); pts.push(new THREE.Vector3(v.x * 1.03, y, v.z * 1.03)); }
+    const curve = new THREE.CatmullRomCurve3(pts, true);
+    const core = new THREE.Mesh(new THREE.TubeGeometry(curve, 96, 0.08, 4, true), new THREE.MeshBasicMaterial({ color: 0x000000 }));
+    const glowTube = new THREE.Mesh(new THREE.TubeGeometry(curve, 96, 0.42, 6, true), haloTubeMat());
+    scene.add(core, glowTube); rings.push(core); ringHalos.push(glowTube);
+  }
+
+  // 裙楼：两层台阶 + 暖光大堂 + 灯带
+  const stoneMat = litMat(0x4a5266);
+  const podium1 = new THREE.Mesh(new THREE.CylinderGeometry(9.2, 9.6, 1.0, 72), stoneMat); podium1.position.y = 0.5;
+  const lobbyCv = document.createElement('canvas'); lobbyCv.width = 64; lobbyCv.height = 16;
+  { const g = lobbyCv.getContext('2d'); g.fillStyle = '#ffc890'; g.fillRect(0, 0, 64, 16); g.fillStyle = '#141924'; g.fillRect(0, 0, 6, 16); g.fillRect(0, 0, 64, 3); g.fillRect(0, 13, 64, 3); }
+  const lobbyTex = new THREE.CanvasTexture(lobbyCv); lobbyTex.colorSpace = THREE.SRGBColorSpace; lobbyTex.wrapS = THREE.RepeatWrapping; lobbyTex.repeat.set(36, 1);
+  const podium2 = new THREE.Mesh(new THREE.CylinderGeometry(6.6, 6.6, 2.4, 72, 1, true), new THREE.MeshBasicMaterial({ map: lobbyTex, color: new THREE.Color(1.4, 1.4, 1.4) }));
+  podium2.position.y = 2.2;
+  const podiumRoof = new THREE.Mesh(new THREE.CylinderGeometry(7.2, 7.2, 0.45, 72), stoneMat); podiumRoof.position.y = 3.6;
+  const edgeMat = new THREE.MeshBasicMaterial({ color: new THREE.Color(0.7, 2.2, 2.8) });
+  const edge1 = new THREE.Mesh(new THREE.TorusGeometry(9.22, 0.06, 4, 96), edgeMat); edge1.rotation.x = Math.PI / 2; edge1.position.y = 1.0;
+  const edge2 = new THREE.Mesh(new THREE.TorusGeometry(7.22, 0.05, 4, 96), edgeMat); edge2.rotation.x = Math.PI / 2; edge2.position.y = 3.83;
+  scene.add(podium1, podium2, podiumRoof, edge1, edge2);
+  // 广场树阵
+  {
+    const TREES = 40;
+    const treeMat = litMat(0x2a5040);
+    const trees = new THREE.InstancedMesh(new THREE.IcosahedronGeometry(0.6, 1), treeMat, TREES);
+    const m = new THREE.Matrix4();
+    for (let k = 0; k < TREES; k++) { const an = (k + 0.5) / TREES * Math.PI * 2, r = PLAZA_R - 1.4; trees.setMatrixAt(k, m.makeScale(1, 1.25, 1).setPosition(Math.cos(an) * r, 0.8, Math.sin(an) * r)); }
+    scene.add(trees);
+  }
+
+  // ---------- 车流：大道上的车灯（白色前灯 / 红色尾灯），位置只由 t 决定 ----------
+  const roads = []; for (let i = 0; i < CITY_N; i++) if (isRoad(i)) roads.push((i - C) * STEP);
+  const cars = [];
+  for (const v of roads) for (const vert of [0, 1]) for (const dir of [-1, 1]) {
+    const n = 14 + Math.floor(rand() * 8);
+    for (let k = 0; k < n; k++) cars.push({ v, vert, dir, off: rand() * GROUND, speed: 5 + rand() * 4, lane: dir * (0.35 + (rand() < 0.5 ? 0 : 0.35)) });
+  }
+  const carMesh = new THREE.InstancedMesh(new THREE.BoxGeometry(1, 1, 1), glowMat, cars.length);
+  { const c = new THREE.Color(); cars.forEach((car, k) => carMesh.setColorAt(k, car.dir > 0 ? c.setRGB(2.6, 2.4, 2.0) : c.setRGB(2.8, 0.2, 0.1))); }
+  scene.add(carMesh);
+  const carM = new THREE.Matrix4();
+  const updateCars = (t) => {
+    cars.forEach((car, k) => {
+      const s = ((car.off + car.dir * car.speed * t) % GROUND + GROUND) % GROUND - GROUND / 2;
+      const x = car.vert ? car.v + car.lane : s, z = car.vert ? s : car.v + car.lane;
+      const hide = Math.hypot(x, z) < PLAZA_R + 0.5 || Math.abs(s) > EXTENT;
+      carM.makeScale(car.vert ? 0.16 : 0.36, hide ? 0 : 0.1, car.vert ? 0.36 : 0.16).setPosition(x, 0.1, z);
+      carMesh.setMatrixAt(k, carM);
+    });
+    carMesh.instanceMatrix.needsUpdate = true;
+  };
+
+  // ---------- 前景低云：几片云，相机下降时从画面边缘掠过（视差） ----------
+  const clouds = [];
+  {
+    const cv = document.createElement('canvas'); cv.width = cv.height = 128;
+    const g = cv.getContext('2d'), img = g.createImageData(128, 128), noise = new ImprovedNoise();
+    for (let y = 0; y < 128; y++) for (let x = 0; x < 128; x++) {
+      const dx = (x - 64) / 64, dy = (y - 64) / 64, r = Math.hypot(dx, dy * 1.5);
+      let n = 0, amp = 1, fr = 3;
+      for (let o = 0; o < 4; o++) { n += amp * noise.noise(x / 128 * fr, y / 128 * fr, 1.7 + o); amp *= 0.5; fr *= 2; }
+      const a = clamp((0.5 + n * 1.0) * (1 - smooth(0.3, 1.0, r)));
+      const k = (y * 128 + x) * 4, warm = y / 128;
+      img.data[k] = 120 + 90 * warm; img.data[k + 1] = 130 + 40 * warm; img.data[k + 2] = 175; img.data[k + 3] = a * 255;
+    }
+    g.putImageData(img, 0, 0);
+    const tex = new THREE.CanvasTexture(cv); tex.colorSpace = THREE.SRGBColorSpace;
+    const r2 = mulberry32(SEED + 11);
+    for (let k = 0; k < 5; k++) {
+      const sp = new THREE.Sprite(new THREE.SpriteMaterial({ map: tex, color: 0xaab4d0, transparent: true, opacity: 0.55, depthWrite: false, fog: true }));
+      const an = -1.2 + (k / 5) * 2.6 + r2() * 0.3, rad = 40 + r2() * 26;
+      sp.position.set(Math.sin(an) * rad, 34 + r2() * 18, Math.cos(an) * rad);
+      const sc = 20 + r2() * 12; sp.scale.set(sc, sc * 0.42, 1);
+      sp.userData.base = sp.position.clone(); sp.userData.drift = 0.6 + r2() * 0.8;
+      scene.add(sp); clouds.push(sp);
+    }
+  }
+
+  // 光晕：塔冠灯笼、塔尖航空灯（加法混合的小精灵，代替昂贵的全屏泛光）
+  const halo = (() => { const cv = document.createElement('canvas'); cv.width = cv.height = 64; const g = cv.getContext('2d');
+    const gr = g.createRadialGradient(32, 32, 0, 32, 32, 32); gr.addColorStop(0, 'rgba(255,255,255,1)'); gr.addColorStop(0.25, 'rgba(255,255,255,0.35)'); gr.addColorStop(1, 'rgba(255,255,255,0)');
+    g.fillStyle = gr; g.fillRect(0, 0, 64, 64); return new THREE.CanvasTexture(cv); })();
+  const mkGlow = (color, size, y) => { const sp = new THREE.Sprite(new THREE.SpriteMaterial({ map: halo, color, transparent: true, blending: THREE.AdditiveBlending, depthWrite: false, fog: true }));
+    sp.scale.set(size, size, 1); sp.position.y = y; scene.add(sp); return sp; };
+  mkGlow(0x7a4c24, 9, TOWER_H + 2.5);
+  const beaconGlow = mkGlow(0xff3020, 3.2, TOWER_H + 11.1);
+
+  // ---------- 相机 ----------
+  const camera = new THREE.PerspectiveCamera(CAM.fov[0], W / H, 0.5, 2000);
+  if (portrait) camera.setViewOffset(W, H, 0, H * 0.04, W, H);
+  const hudTitle = document.getElementById('title'), hudSub = document.getElementById('sub');
+  // 屏幕压暗：最后画一张铺满屏幕的网格（不随相机动），乘法混合 → 暗角 + 上下压暗 + 标题身后的压暗（随标题淡入）
+  {
+    const shadeMat = new THREE.ShaderMaterial({
+      transparent: true, depthTest: false, depthWrite: false, toneMapped: false,
+      blending: THREE.CustomBlending, blendSrc: THREE.ZeroFactor, blendDst: THREE.SrcColorFactor,
+      uniforms: { uScrim: scrimU },
+      vertexShader: `uniform float uScrim; varying float vShade;
+        void main() {
+          vec2 p = position.xy * 0.5 + 0.5; float y = 1.0 - p.y;                     // y 从画面顶部算
+          float a = ${VIGNETTE.toFixed(3)} * clamp((length(vec2((p.x - 0.5) / 0.75, (y - 0.48) / 0.7)) - 0.55) / 0.45, 0.0, 1.0);
+          float top = 0.35 * clamp(1.0 - y / 0.22, 0.0, 1.0), bot = 0.4 * clamp((y - 0.7) / 0.3, 0.0, 1.0);
+          float ds = length(vec2((p.x - 0.3) / 0.8, (y - 0.73) / 0.2));             // 标题区（左下）的椭圆
+          float sc = uScrim * (ds < 0.45 ? mix(1.0, 0.58, ds / 0.45) : mix(0.58, 0.0, clamp((ds - 0.45) / 0.55, 0.0, 1.0)));
+          vShade = (1.0 - a) * (1.0 - top) * (1.0 - bot) * (1.0 - sc);
+          gl_Position = vec4(position.xy, 0.0, 1.0);
+        }`,
+      fragmentShader: 'varying float vShade; void main(){ gl_FragColor = vec4(vec3(vShade), 1.0); }',
+    });
+    const shade = new THREE.Mesh(new THREE.PlaneGeometry(2, 2, 40, 40), shadeMat);
+    shade.frustumCulled = false; shade.renderOrder = 1000; scene.add(shade);
+  }
+  const look = new THREE.Vector3(), accent = new THREE.Color(ACCENT);
+
+  draw = (t) => {
+    // 环绕：方位角全程缓动；推近：后段距离和高度收紧，注视点从城市中心升到塔冠
+    const orbit = easeInOut(seg(t, 0, DURATION));
+    const push = easeInOut(seg(t, DURATION * CAM.pushStart, DURATION));
+    const az = lerp(CAM.az[0], CAM.az[1], orbit);
+    const dr = portrait ? CAM.distPortrait : CAM.dist;
+    const dist = lerp(dr[0], dr[1], push);
+    const height = lerp(CAM.height[0], CAM.height[1], Math.pow(push, 0.85));
+    camera.position.set(Math.sin(az) * dist, height, Math.cos(az) * dist);
+    look.set(0, lerp(CAM.lookY[0], CAM.lookY[1], push), 0);
+    camera.lookAt(look);
+    camera.fov = lerp(CAM.fov[0], CAM.fov[1], push); camera.updateProjectionMatrix();
+    focusU.value = FOCUS_BLUR * smooth(0.35, 1.0, push);   // 景深：推近后段远景逐渐变柔
+
+    // 发光环逐个点亮；扫描光沿塔身上升；航空灯闪烁；车流；云缓慢漂移（离相机太近时淡出）
+    // 环的亮度压在不过曝的范围（保留青色，不糊成纯白），光晕管负责“发光”感
+    rings.forEach((core, k) => { const on = easeOut(seg(t, 1.8 + k * 0.38, 2.5 + k * 0.38)); core.material.color.copy(accent).multiplyScalar(0.12 + 1.15 * on); ringHalos[k].material.color.copy(accent).multiplyScalar(0.45 * on); });
+    scanU.value = lerp(-4, TOWER_H + 6, seg(t, 1.6, DURATION - 0.6));
+    const blink = 0.15 + 0.85 * Math.pow(Math.max(0, Math.sin(t * Math.PI * 1.6)), 6);
+    const red = new THREE.Color(4 * blink, 0.25 * blink, 0.15 * blink);
+    for (let k = 0; k < reds.length; k++) redMesh.setColorAt(k, red);
+    redMesh.instanceColor.needsUpdate = true;
+    beaconGlow.material.opacity = blink;
+    updateCars(t);
+    clouds.forEach((sp) => {
+      sp.position.copy(sp.userData.base); sp.position.x += t * sp.userData.drift;
+      sp.material.opacity = 0.55 * smooth(8, 26, sp.position.distanceTo(camera.position));
+    });
+
+    const a = easeOut(seg(t, DURATION - 2.6, DURATION - 1.6)), b = easeOut(seg(t, DURATION - 2.1, DURATION - 1.1));
+    hudTitle.style.opacity = a; hudTitle.style.transform = `translateY(${(1 - a) * 3}vmin)`;
+    hudSub.style.opacity = b; scrimU.value = SCRIM * a;
+    renderer.render(scene, camera);
+  };
+  await renderer.compileAsync(scene, camera); // 并行编译全部可见物体的着色器（此时所有物体都还可见）
+  draw(0);                                    // 预热一帧：上传贴图
+})();
+window.renderFrame = async (t) => { await window.sceneReady; draw(t); };
+</script>
+</body>
+</html>

@@ -1,0 +1,758 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<!-- 地质勘探：程序化三维地质块体（带植被/等高线的地表 + 褶皱、断层错开的岩层剖面）+ AI 预测靶区热力 + 分级品位壳的隐伏矿体 + 钻孔逐根钻进（岩芯按岩性/品位分段着色），相机环绕推近。 -->
+<style>
+  html, body { margin: 0; width: 100%; height: 100%; overflow: hidden; background: radial-gradient(130% 90% at 50% 30%, #1d2a3a 0%, #0b1018 65%, #05070b 100%); }
+  canvas { display: block; position: fixed; inset: 0; }
+  #vignette { position: fixed; inset: 0; pointer-events: none; background: radial-gradient(120% 95% at 50% 45%, rgba(0,0,0,0) 55%, rgba(0,0,0,0.45) 100%); }
+  #hud { position: fixed; inset: 0; font-family: "Noto Sans CJK SC", sans-serif; color: #fff; pointer-events: none; }
+  #title { position: absolute; left: 7%; right: 7%; top: 6%; font-size: 6.6vmin; font-weight: 900; letter-spacing: 0.03em; text-shadow: 0 0.4vmin 2vmin rgba(0,0,0,0.6); }
+  #sub { position: absolute; left: 7%; right: 7%; top: calc(6% + 9vmin); font-size: 3.4vmin; color: #a9c2dc; text-shadow: 0 0.3vmin 1.5vmin rgba(0,0,0,0.6); }
+  #stat { position: absolute; left: 7%; top: calc(6% + 15vmin); font-size: 3.4vmin; font-weight: 700; color: #ffd27a; }
+  #stat:not(:empty) { padding: 0.5vmin 1.8vmin; border-radius: 1vmin; background: rgba(12,18,28,0.72); border: 0.25vmin solid rgba(255,210,122,0.55); }
+  #legend { position: absolute; right: 7%; bottom: 21%; font-size: 3.2vmin; font-weight: 700; color: #e3edf7; text-align: right; padding: 1.6vmin 2.2vmin; border-radius: 1.2vmin; background: rgba(10,16,26,0.72); border: 0.2vmin solid rgba(160,190,220,0.3); }
+  @media (min-aspect-ratio: 1/1) { #legend { left: 7%; right: auto; bottom: 12%; text-align: left; } }
+  #legend .bar { width: 32vmin; height: 2vmin; margin-top: 1.2vmin; border-radius: 0.5vmin; background: linear-gradient(90deg, #ffe08a, #ff9a3c, #e8402a, #b0124f); }
+  #legend .ticks { display: flex; justify-content: space-between; width: 32vmin; margin-top: 0.7vmin; font-size: 2.9vmin; font-weight: 500; color: #c3d3e3; }
+</style>
+<script type="importmap">
+{ "imports": { "three": "/vendor/three/build/three.module.js", "three/addons/": "/vendor/three/examples/jsm/" } }
+</script>
+</head>
+<body>
+<div id="vignette"></div>
+<div id="hud">
+  <div id="title">三维地质模型</div>
+  <div id="sub">AI 圈定靶区 · 钻孔验证隐伏矿体</div>
+  <div id="stat"></div>
+  <div id="legend">矿化品位 低 → 高<div class="bar"></div><div class="ticks"><span>边界</span><span>中</span><span>富矿</span></div></div>
+</div>
+<script type="module">
+import * as THREE from 'three';
+import { SimplexNoise } from 'three/addons/math/SimplexNoise.js';
+import { mergeVertices } from 'three/addons/utils/BufferGeometryUtils.js';
+
+// ================= 可编辑参数（改这里就够了） =================
+const DURATION = 8;                 // 镜头时长（秒）
+const SEED = 2024;                  // 地形/地层随机种子：换一个数字就是另一片地形
+// 岩层从上到下（地表下另有一层随地形起伏的表土）。[名称, 颜色, 岩性纹理, 厚度]；
+// 岩性纹理可选：sand 砂岩（细颗粒+交错层理）、mud 泥岩（细纹层）、lime 灰岩（层理+节理成块）、cong 砾岩（砾石）、shale 页岩（薄片理）、granite 花岗岩（晶粒）；最后一层是基底，厚度不用管
+const STRATA = [
+  ['砂岩', '#c4a277', 'sand', 2.2],
+  ['泥岩', '#86705c', 'mud', 1.3],
+  ['灰岩', '#b3b2a6', 'lime', 2.3],
+  ['砾岩', '#9a8064', 'cong', 1.5],
+  ['页岩', '#6e6870', 'shale', 1.7],
+  ['花岗岩基底', '#a8968f', 'granite', 0],
+];
+const SOIL = { depth: 0.45, color: '#6b5238' };                    // 表土层厚度与颜色
+const FOLD = { amp: 1.1, wavelength: 17, strikeDeg: 30 };          // 褶皱：起伏幅度、波长、走向（度）
+const FAULT = { x: -2.6, strikeDeg: 18, dipDeg: 62, throw: 1.6 };  // 正断层：过 x 处、走向、倾角、断距（上盘下降）
+// 矿体（变形椭球，带倾角）：位置、半轴、旋转；GRADE_NOISE 越大品位壳越不规则
+const ORE = { pos: new THREE.Vector3(0.8, -4.8, 0.3), scale: new THREE.Vector3(6.0, 2.3, 3.5), rot: new THREE.Euler(0, 0.5, -0.4) };
+const GRADE_NOISE = 0.12;
+// 品位色带（低 → 高），与图例一致
+const GRADE_COLORS = ['#ffe08a', '#ff9a3c', '#e8402a', '#b0124f'];
+// 钻孔：[地表 x, z, 方位角(弧度), 倾角(与水平夹角, 度), 孔深]；每根依次开钻。标签高度在准备阶段自动错开，不用手调
+const HOLE_DEFS = [
+  [-5.5, 3.0, 5.9, 72, 15], [-2.5, -3.0, 0.6, 76, 15], [0.5, 2.8, 4.9, 80, 15], [2.6, -1.6, 2.4, 78, 15],
+  [5.2, 3.0, 4.1, 74, 15], [6.6, -3.2, 2.6, 72, 15], [-0.6, -0.1, 1.0, 86, 15],
+];
+const HOLE_FIRST = 2.9, HOLE_GAP = 0.45, DRILL_TIME = 2.4;          // 第一根开钻时刻、相邻间隔、每根钻进用时（秒）
+// 时间线（秒）：靶区热力淡入、岩体变透明（透视）
+const T_HEAT = [0.8, 2.0], T_XRAY = [2.0, 3.2];
+// 相机：环绕方位角（弧度）起止、俯角（弧度）起止（俯角在透视阶段前降低，少看空底面、多看矿体）、块体占画面区域的比例（起 → 止）
+const CAM = { az: [0.55, 2.05], el: [0.66, 0.3], fill: [0.9, 1.0] };
+
+// ---------- 准备阶段（异步）：先等字体，再同步建场景（程序化贴图在这里一次生成），最后异步编译着色器并预热一帧 ----------
+// 系统在逐帧截图前会 await window.sceneReady（最多 30 秒）；renderFrame 自己也会等它。
+let draw; // 逐帧绘制函数 draw(t)，准备完成后赋值
+window.sceneReady = (async () => {
+  // 系统字体（Noto Sans CJK SC）不走网络，但仍先 load，确保画布写中文时字体已就绪
+  await Promise.all(['500', '700', '900'].map((w) => document.fonts.load(`${w} 64px "Noto Sans CJK SC"`, '中文')));
+
+  // ---------- 通用 ----------
+  const W = innerWidth, H = innerHeight;
+  const clamp = (x, a = 0, b = 1) => Math.min(b, Math.max(a, x));
+  const seg = (t, a, b) => clamp((t - a) / (b - a));
+  const easeInOut = (x) => (x < 0.5 ? 4 * x * x * x : 1 - Math.pow(-2 * x + 2, 3) / 2);
+  const easeOut = (x) => 1 - Math.pow(1 - x, 3);
+  const lerp = (a, b, x) => a + (b - a) * x;
+  const smooth = (a, b, x) => { const k = clamp((x - a) / (b - a)); return k * k * (3 - 2 * k); };
+  function mulberry32(a) { return () => { a |= 0; a = (a + 0x6d2b79f5) | 0; let t = Math.imul(a ^ (a >>> 15), 1 | a); t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t; return ((t ^ (t >>> 14)) >>> 0) / 4294967296; }; }
+  const hash2 = (i, j) => { let h = Math.imul(i, 374761393) + Math.imul(j, 668265263) + SEED; h = Math.imul(h ^ (h >>> 13), 1274126177); return ((h ^ (h >>> 16)) >>> 0) / 4294967296; };
+  const hexRGB = (hex) => { const c = new THREE.Color(hex); return [c.r * 255, c.g * 255, c.b * 255]; }; // sRGB 0..255（画布用）
+  const simplex = new SimplexNoise({ random: mulberry32(SEED) }); // 带种子：同一种子每次生成同一片地形
+  const n2 = (x, y) => simplex.noise(x, y), n3 = (x, y, z) => simplex.noise3d(x, y, z);
+  // 可平铺的值噪声（size×size，0..1），给逐像素纹理提供细节，比逐像素算 simplex 快得多
+  function tileNoise(size, cells, seed) {
+    const out = new Float32Array(size * size), r = mulberry32(seed);
+    let wsum = 0;
+    cells.forEach((cn, o) => {
+      const g = new Float32Array(cn * cn).map(() => r()), w = 1 / (o + 1); wsum += w;
+      for (let y = 0; y < size; y++) for (let x = 0; x < size; x++) {
+        const fx = (x / size) * cn, fy = (y / size) * cn, ix = Math.floor(fx), iy = Math.floor(fy);
+        const sx = fx - ix, sy = fy - iy, ux = sx * sx * (3 - 2 * sx), uy = sy * sy * (3 - 2 * sy);
+        const a = g[iy * cn + ix], b = g[iy * cn + (ix + 1) % cn], c = g[((iy + 1) % cn) * cn + ix], d = g[((iy + 1) % cn) * cn + (ix + 1) % cn];
+        out[y * size + x] += w * (a + (b - a) * ux + (c - a) * uy + (a - b - c + d) * ux * uy);
+      }
+    });
+    return out.map((v) => v / wsum);
+  }
+  const NT = 256, NTM = NT - 1, NZ = tileNoise(NT, [8, 16, 32, 64], SEED + 1);
+  const nz = (u, v) => NZ[((v | 0) & NTM) * NT + ((u | 0) & NTM)];
+  // 在可平铺画布上画图形：靠边的图形在对边再画一次，保证无缝
+  function tileCanvas(size, bg, drawFn) {
+    const c = document.createElement('canvas'); c.width = c.height = size;
+    const g = c.getContext('2d'); g.fillStyle = bg; g.fillRect(0, 0, size, size);
+    const wrap = (fn) => { for (const dx of [-size, 0, size]) for (const dy of [-size, 0, size]) { g.save(); g.translate(dx, dy); fn(g); g.restore(); } };
+    drawFn(g, wrap, mulberry32(SEED + size));
+    return g.getImageData(0, 0, size, size).data;
+  }
+  // 中文标签：画布贴图做成 Sprite，始终朝向相机；左侧色条做强调。返回的 sprite.userData.aspect 是宽高比（排布标签用）
+  function labelCanvas(text, { px = 44, color = '#ffffff', bg = 'rgba(10,16,26,0.86)', border = 'rgba(255,255,255,0.3)', accent = null } = {}) {
+    const c = document.createElement('canvas'), g = c.getContext('2d');
+    const font = `700 ${px}px "Noto Sans CJK SC"`, pad = accent ? px * 0.45 : 0;
+    g.font = font;
+    c.width = Math.ceil(g.measureText(text).width + px * 1.1 + pad); c.height = Math.ceil(px * 1.6);
+    g.font = font; g.textBaseline = 'middle'; g.textAlign = 'center';
+    g.fillStyle = bg; g.strokeStyle = border; g.lineWidth = 3;
+    g.beginPath(); g.roundRect(2, 2, c.width - 4, c.height - 4, px * 0.28); g.fill(); g.stroke();
+    if (accent) { g.fillStyle = accent; g.beginPath(); g.roundRect(px * 0.22, px * 0.32, px * 0.16, c.height - px * 0.64, px * 0.08); g.fill(); }
+    g.fillStyle = color; g.fillText(text, (c.width + pad) / 2, c.height / 2 + px * 0.04);
+    const tex = new THREE.CanvasTexture(c); tex.colorSpace = THREE.SRGBColorSpace;
+    return tex;
+  }
+  function makeLabel(text, opts = {}) {
+    const tex = labelCanvas(text, opts), height = opts.height ?? 1;
+    const s = new THREE.Sprite(new THREE.SpriteMaterial({ map: tex, depthTest: false, transparent: true, fog: false }));
+    s.userData.aspect = tex.image.width / tex.image.height;
+    s.scale.set(height * s.userData.aspect, height, 1);
+    s.center.set(0.5, 0);
+    s.renderOrder = 20;
+    return s;
+  }
+  // 径向渐变贴图（发光光晕、接触阴影用）
+  function radialTex(stops, size = 128) {
+    const c = document.createElement('canvas'); c.width = c.height = size;
+    const g = c.getContext('2d'), gr = g.createRadialGradient(size / 2, size / 2, 0, size / 2, size / 2, size / 2);
+    stops.forEach(([o, col]) => gr.addColorStop(o, col));
+    g.fillStyle = gr; g.fillRect(0, 0, size, size);
+    const t = new THREE.CanvasTexture(c); t.colorSpace = THREE.SRGBColorSpace; return t;
+  }
+
+  // ---------- 渲染器 / 灯光 ----------
+  // 系统按 2 倍像素渲染再缩小（超采样抗锯齿），所以 pixelRatio 必须跟随 devicePixelRatio；超采样已抗锯齿，关掉 MSAA 省一大半时间
+  const DPR = window.devicePixelRatio || 1;
+  const renderer = new THREE.WebGLRenderer({ antialias: DPR < 2, alpha: true, preserveDrawingBuffer: true });
+  renderer.setPixelRatio(DPR);
+  renderer.setSize(W, H);
+  renderer.setClearColor(0x000000, 0);
+  renderer.toneMapping = THREE.ACESFilmicToneMapping;
+  renderer.toneMappingExposure = 1.1;
+  document.body.prepend(renderer.domElement);
+  const scene = new THREE.Scene();
+  window.__three = { renderer, scene }; // 让渲染系统统计三角形数
+  scene.fog = new THREE.Fog(0x0c131d, 30, 90); // 远处略压暗，加强纵深（每帧随相机距离调整）
+  // 软件渲染（无 GPU）下逐像素光照很贵：大面积的地表、剖面、底面把光照“烘焙”进贴图，用不受光的 MeshBasicMaterial；
+  // 只有钻机、钻孔这些小物体用真实灯光（暖色主光 + 冷色轮廓光 + 半球光）
+  const sunDir = new THREE.Vector3(8, 14, 6).normalize();
+  const sun = new THREE.DirectionalLight(0xfff0dc, 2.3); sun.position.copy(sunDir).multiplyScalar(30); scene.add(sun);
+  const rim = new THREE.DirectionalLight(0x8fbaff, 0.9); rim.position.set(-12, 6, -10); scene.add(rim);
+  scene.add(new THREE.HemisphereLight(0xb4d0ff, 0x4a3826, 1.2));
+
+  // ---------- 地形（高度场） ----------
+  const SIZE = 20, HALF = SIZE / 2, BOTTOM = -10, RES = 80, YMAX = 5; // RES：地形网格细分（软件渲染下顶点数很影响速度，细节靠贴图）
+  function heightAt(x, z) {
+    let h = 0, amp = 1.3, f = 0.07;
+    for (let o = 0; o < 4; o++) { h += amp * n3(x * f, z * f, 1.7); amp *= 0.45; f *= 2.0; }
+    return 1.2 + h + 0.9 * Math.exp(-((x + 4) ** 2 + (z + 3) ** 2) / 18); // 加一座山包
+  }
+  const terrainGeo = new THREE.PlaneGeometry(SIZE, SIZE, RES, RES);
+  terrainGeo.rotateX(-Math.PI / 2);
+  const tp = terrainGeo.attributes.position;
+  let TOPY = -1e9;
+  for (let i = 0; i < tp.count; i++) { const y = heightAt(tp.getX(i), tp.getZ(i)); tp.setY(i, y); TOPY = Math.max(TOPY, y); }
+  terrainGeo.deleteAttribute('normal'); // 不受光，不需要法线
+  // 高程网格（贴图生成时双线性插值用，比逐像素算噪声快）
+  const HG = 257, hgrid = new Float32Array(HG * HG), fgrid = new Float32Array(HG * HG);
+  for (let j = 0; j < HG; j++) for (let i = 0; i < HG; i++) {
+    const x = -HALF + (i / (HG - 1)) * SIZE, z = -HALF + (j / (HG - 1)) * SIZE;
+    hgrid[j * HG + i] = heightAt(x, z);
+    fgrid[j * HG + i] = n2(x * 0.16 + 11, z * 0.16) + 0.5 * n2(x * 0.45, z * 0.45 + 7); // 林地分布
+  }
+  const bil = (grid, x, z) => {
+    const fx = clamp((x + HALF) / SIZE) * (HG - 1), fz = clamp((z + HALF) / SIZE) * (HG - 1);
+    const i = Math.min(HG - 2, fx | 0), j = Math.min(HG - 2, fz | 0), sx = fx - i, sz = fz - j, k = j * HG + i;
+    return (grid[k] * (1 - sx) + grid[k + 1] * sx) * (1 - sz) + (grid[k + HG] * (1 - sx) + grid[k + HG + 1] * sx) * sz;
+  };
+
+  // ---------- 地层模型：同一个函数决定侧壁剖面、钻孔岩芯颜色 ----------
+  const sk = THREE.MathUtils.degToRad(FOLD.strikeDeg), fa = THREE.MathUtils.degToRad(FAULT.strikeDeg);
+  const faultTan = Math.tan(THREE.MathUtils.degToRad(FAULT.dipDeg));
+  const fold = (x, z) => FOLD.amp * Math.cos(((x * Math.cos(sk) + z * Math.sin(sk)) / FOLD.wavelength) * Math.PI * 2 + 0.6);
+  const faultS = (x, y, z) => (x - FAULT.x) * Math.cos(fa) + z * Math.sin(fa) - y / faultTan; // <0 为上盘
+  const TOP0 = 3.4; // 岩层顶面的平均高程（高于地表的部分被“剥蚀”掉）
+  const NB = STRATA.length - 1, cum = [];
+  { let s = TOP0; for (let k = 0; k < NB; k++) { s -= STRATA[k][3]; cum.push(s); } }
+  function boundaries(x, z, out) { // 各岩层底界高程（未经断层错动）
+    const f = fold(x, z);
+    for (let k = 0; k < NB; k++) out[k] = cum[k] + f + 0.35 * n3(x * 0.2, z * 0.2, k * 3.1) + 0.07 * n3(x * 0.9, z * 0.9, k + 0.5);
+    return out;
+  }
+  // 返回 -1 = 表土，0.. = STRATA 下标
+  const _b = new Float32Array(NB);
+  function layerAt(x, y, z) {
+    if (y > heightAt(x, z) - SOIL.depth) return -1;
+    boundaries(x, z, _b);
+    const yy = faultS(x, y, z) < 0 ? y + FAULT.throw : y;
+    let k = 0; while (k < NB && yy < _b[k]) k++;
+    return k;
+  }
+
+  // ---------- 岩性纹理（逐像素） ----------
+  const LITHO = STRATA.map(([, col, kind]) => ({ rgb: hexRGB(col), kind }));
+  const SOIL_RGB = hexRGB(SOIL.color);
+  // 砾岩、花岗岩用画布画形状（可平铺小图），其它岩性逐像素公式
+  const congTile = tileCanvas(256, '#8f765a', (g, wrap, r) => {
+    for (let i = 0; i < 260; i++) {
+      const x = r() * 256, y = r() * 256, rx = 2 + r() * 6, ry = rx * (0.55 + r() * 0.35), a = r() * Math.PI, l = 45 + r() * 40, hue = 20 + r() * 25;
+      wrap((g) => { g.fillStyle = `hsl(${hue},${10 + r() * 15}%,${l}%)`; g.strokeStyle = 'rgba(40,28,18,0.55)'; g.lineWidth = 1; g.beginPath(); g.ellipse(x, y, rx, ry, a, 0, 7); g.fill(); g.stroke(); });
+    }
+  });
+  const graniteTile = tileCanvas(256, '#a38f96', (g, wrap, r) => {
+    const cols = ['#d9c3c6', '#c48f8f', '#ede6e0', '#3a3436', '#8a7b80', '#b8a2a8'];
+    for (let i = 0; i < 1400; i++) {
+      const x = r() * 256, y = r() * 256, s = 1 + r() * 3.2, c = cols[(r() * cols.length) | 0];
+      wrap((g) => { g.fillStyle = c; g.beginPath(); g.moveTo(x, y - s); g.lineTo(x + s, y + s * 0.3); g.lineTo(x - s * 0.4, y + s); g.lineTo(x - s, y - s * 0.2); g.fill(); });
+    }
+  });
+  const sampleTile = (tile, u, v, out) => { const k = ((((v | 0) & 255) * 256) + ((u | 0) & 255)) * 4; out[0] = tile[k]; out[1] = tile[k + 1]; out[2] = tile[k + 2]; };
+  const _c = [0, 0, 0];
+  // 岩性像素颜色：u,v 为岩层内坐标（像素，v 随褶皱弯曲），结果写进 out（0..255）
+  function lithoColor(k, u, v, out) {
+    if (k < 0) { // 表土：棕色 + 碎石/根系斑点
+      const n = nz(u * 1.5, v * 1.5), hsh = hash2(u | 0, v | 0);
+      const m = 0.82 + 0.35 * n + (hsh > 0.97 ? 0.25 : hsh < 0.03 ? -0.25 : 0);
+      out[0] = SOIL_RGB[0] * m; out[1] = SOIL_RGB[1] * m; out[2] = SOIL_RGB[2] * m; return out;
+    }
+    const L = LITHO[k], b = L.rgb, n = nz(u, v), hs = hash2(u | 0, v | 0) - 0.5;
+    let m = 1;
+    switch (L.kind) {
+      case 'sand': m = 0.86 + 0.24 * n + 0.1 * hs + 0.05 * Math.sin(v * 0.7 + u * 0.18 * Math.sin(Math.floor(v / 14) * 2.1) + n * 4); break;
+      case 'mud': m = 0.84 + 0.2 * n + 0.04 * hs + 0.07 * Math.sin(v * 1.6 + n * 6); break;
+      case 'shale': m = 0.82 + 0.22 * n + 0.05 * hs + ((v | 0) % 3 === 0 ? -0.1 : 0.03); break;
+      case 'lime': {
+        const bed = Math.floor(v / 17), bv = v - bed * 17, jw = 34 + ((hash2(bed, 7) * 40) | 0), ju = (u + hash2(bed, 3) * 200) % jw;
+        m = 0.9 + 0.16 * n + 0.05 * hs;
+        if (bv < 1.4) m *= 0.62; else if (ju < 1.2) m *= 0.72; else if (bv < 3) m *= 1.06; // 层理面、节理缝
+        break;
+      }
+      case 'cong': sampleTile(congTile, u, v, out); m = 0.85 + 0.25 * n; out[0] *= m * b[0] / 143; out[1] *= m * b[1] / 118; out[2] *= m * b[2] / 90; return out;
+      case 'granite': sampleTile(graniteTile, u, v, out); m = 0.85 + 0.25 * n; out[0] *= m * b[0] / 163; out[1] *= m * b[1] / 143; out[2] *= m * b[2] / 150; return out;
+    }
+    out[0] = b[0] * m; out[1] = b[1] * m; out[2] = b[2] * m; return out;
+  }
+
+  // ---------- 地层剖面：四面侧壁各一张剖面贴图（地层界面起伏、褶皱、断层错开，四面连续） ----------
+  const TW = 1024, TH = 768, PPU = TW / SIZE; // 剖面贴图分辨率（像素/单位）
+  function sectionTexture(ax, az, bx, bz) {
+    const c = document.createElement('canvas'); c.width = TW; c.height = TH;
+    const g = c.getContext('2d'), img = g.createImageData(TW, TH), d = img.data, bnd = new Float32Array(NB);
+    for (let i = 0; i < TW; i++) {
+      const s = (i + 0.5) / TW, x = lerp(ax, bx, s), z = lerp(az, bz, s), top = heightAt(x, z), f = fold(x, z);
+      boundaries(x, z, bnd);
+      const fs0 = (x - FAULT.x) * Math.cos(fa) + z * Math.sin(fa);
+      for (let j = 0; j < TH; j++) {
+        const y = YMAX - ((j + 0.5) / TH) * (YMAX - BOTTOM), o = (j * TW + i) * 4;
+        if (y > top + 0.05) { d[o + 3] = 0; continue; }
+        const fsv = fs0 - y / faultTan, hang = fsv < 0, yy = hang ? y + FAULT.throw : y;
+        let k = 0; while (k < NB && yy < bnd[k]) k++;
+        const soil = y > top - SOIL.depth - 0.08 * nz(i * 3, 9);
+        lithoColor(soil ? -1 : k, i + (hang ? 97 : 0), (f - yy) * PPU + (k * 61), _c);
+        let m = 1;
+        if (!soil) {
+          const dUp = k > 0 ? bnd[k - 1] - yy : 9, dDn = k < NB ? yy - bnd[k] : 9, dc = Math.min(dUp, dDn);
+          if (dc < 0.035) m *= 0.5; else if (dc < 0.09) m *= 0.86;                 // 地层接触线
+          const af = Math.abs(fsv);
+          if (af < 0.07) m *= 0.3; else if (af < 0.26) m *= 0.78 + 0.22 * nz(j * 2, i * 2); // 断层面 + 破碎带
+        } else if (y > top - 0.1) { _c[0] = 70; _c[1] = 92; _c[2] = 48; } // 地表草皮边
+        m *= 0.8 + 0.2 * clamp((y - BOTTOM) / 8);                                  // 越深越暗一点，加纵深
+        d[o] = _c[0] * m; d[o + 1] = _c[1] * m; d[o + 2] = _c[2] * m; d[o + 3] = 255;
+      }
+    }
+    g.putImageData(img, 0, 0);
+    // 深度刻度：两侧竖边每 1 单位一短刻度、每 5 单位一长刻度（比例感）
+    g.fillStyle = 'rgba(235,242,250,0.9)';
+    for (let y = Math.floor(YMAX); y >= BOTTOM; y--) {
+      const py = ((YMAX - y) / (YMAX - BOTTOM)) * TH, len = y % 5 === 0 ? 26 : 12;
+      if (y > Math.min(heightAt(ax, az), heightAt(bx, bz)) - 0.3) continue;
+      g.fillRect(0, py - 1.5, len, 3); g.fillRect(TW - len, py - 1.5, len, 3);
+    }
+    const t = new THREE.CanvasTexture(c); t.colorSpace = THREE.SRGBColorSpace;
+    return t;
+  }
+  function wallGeo(ax, az, bx, bz) {
+    const pos = [], uv = [], idx = [];
+    for (let i = 0; i <= RES; i++) {
+      const s = i / RES, x = lerp(ax, bx, s), z = lerp(az, bz, s), top = heightAt(x, z);
+      pos.push(x, top, z, x, BOTTOM, z);
+      uv.push(s, (top - BOTTOM) / (YMAX - BOTTOM), s, 0);
+      if (i < RES) { const a = i * 2; idx.push(a, a + 1, a + 2, a + 1, a + 3, a + 2); }
+    }
+    const g = new THREE.BufferGeometry();
+    g.setAttribute('position', new THREE.Float32BufferAttribute(pos, 3));
+    g.setAttribute('uv', new THREE.Float32BufferAttribute(uv, 2));
+    g.setIndex(idx);
+    return g;
+  }
+  // 侧壁明暗（烘焙光照）：从外面看 = 环境 + 主光照射（朝光的面亮）；透视阶段从里面看背面两壁 = 均匀亮度，像展示用的剖面
+  const WALL_SHADE = { ambient: 0.5, sun: 0.75, inside: 0.78 };
+  const walls = [];
+  for (const [ax, az, bx, bz] of [[-HALF, HALF, HALF, HALF], [HALF, HALF, HALF, -HALF], [HALF, -HALF, -HALF, -HALF], [-HALF, -HALF, -HALF, HALF]]) {
+    const mat = new THREE.MeshBasicMaterial({ map: sectionTexture(ax, az, bx, bz), side: THREE.DoubleSide, transparent: true });
+    const m = new THREE.Mesh(wallGeo(ax, az, bx, bz), mat);
+    m.userData.normal = new THREE.Vector3((ax + bx) / 2, 0, (az + bz) / 2).normalize();
+    m.userData.center = new THREE.Vector3((ax + bx) / 2, (BOTTOM + 2) / 2, (az + bz) / 2);
+    m.userData.outside = WALL_SHADE.ambient + WALL_SHADE.sun * Math.max(0, m.userData.normal.dot(sunDir));
+    scene.add(m); walls.push(m);
+  }
+  // 块体底面（透视时可见）：深色基岩 + 淡网格（比例感），不抢矿体的戏
+  const floorTex = (() => {
+    const c = document.createElement('canvas'); c.width = c.height = 512; const g = c.getContext('2d');
+    const gr = g.createRadialGradient(256, 256, 40, 256, 256, 360); gr.addColorStop(0, '#2a2c33'); gr.addColorStop(1, '#16181d');
+    g.fillStyle = gr; g.fillRect(0, 0, 512, 512); g.strokeStyle = 'rgba(150,180,210,0.09)'; g.lineWidth = 2;
+    for (let i = 0; i <= 10; i++) { const p = i * 51.2; g.beginPath(); g.moveTo(p, 0); g.lineTo(p, 512); g.moveTo(0, p); g.lineTo(512, p); g.stroke(); }
+    const t = new THREE.CanvasTexture(c); t.colorSpace = THREE.SRGBColorSpace; return t;
+  })();
+  const floor = new THREE.Mesh(new THREE.PlaneGeometry(SIZE, SIZE).rotateX(-Math.PI / 2), new THREE.MeshBasicMaterial({ map: floorTex }));
+  floor.position.y = BOTTOM + 0.005; scene.add(floor);
+  // 台面：接触阴影（只在块体周围一小片）+ 线框网格（线比整屏贴图便宜得多），远处渐隐
+  const shadow = new THREE.Mesh(new THREE.PlaneGeometry(30, 30).rotateX(-Math.PI / 2), new THREE.MeshBasicMaterial({
+    map: radialTex([[0, 'rgba(0,0,0,0.8)'], [0.5, 'rgba(0,0,0,0.55)'], [1, 'rgba(0,0,0,0)']]), transparent: true, depthWrite: false, fog: false,
+  }));
+  shadow.position.y = BOTTOM - 0.02; shadow.renderOrder = -1; scene.add(shadow);
+  {
+    const pos = [], col = [], G = 22, STEP = 2;
+    const alpha = (x, z) => 0.5 * (1 - smooth(9, G, Math.hypot(x, z)));
+    for (let i = -G; i <= G; i += STEP) for (let j = -G; j < G; j += STEP) {
+      for (const [x0, z0, x1, z1] of [[i, j, i, j + STEP], [j, i, j + STEP, i]]) {
+        pos.push(x0, BOTTOM - 0.03, z0, x1, BOTTOM - 0.03, z1);
+        col.push(0.55, 0.69, 0.84, alpha(x0, z0), 0.55, 0.69, 0.84, alpha(x1, z1));
+      }
+    }
+    const g = new THREE.BufferGeometry();
+    g.setAttribute('position', new THREE.Float32BufferAttribute(pos, 3)); g.setAttribute('color', new THREE.Float32BufferAttribute(col, 4));
+    const grid = new THREE.LineSegments(g, new THREE.LineBasicMaterial({ vertexColors: true, transparent: true, depthWrite: false, fog: false }));
+    grid.renderOrder = -2; scene.add(grid);
+  }
+
+  // ---------- 矿体：品位函数 + 三层品位壳（边界品位 / 中品位 / 富矿核） ----------
+  const oreRadius = (d) => 1 + 0.15 * n3(d.x * 1.4 + 3, d.y * 1.4, d.z * 1.4) + 0.04 * n3(d.x * 3.5, d.y * 3.5 + 5, d.z * 3.5);
+  const oreM = new THREE.Matrix4().compose(ORE.pos, new THREE.Quaternion().setFromEuler(ORE.rot), ORE.scale), oreInv = oreM.clone().invert();
+  const gradeLocal = (q, r, R) => clamp(0.25 + 0.75 * (1 - r / R) + GRADE_NOISE * n3(q.x * 1.8 + 7, q.y * 1.8, q.z * 1.8) * Math.min(1, 3 * (1 - r / R)), 0.25, 1);
+  // 点在矿体内的“品位”：0 = 不在矿体内，0.25（边界品位）… 1（富矿核）。钻孔见矿段、品位壳都用它，保证一致
+  function gradeAt(p) {
+    const q = p.clone().applyMatrix4(oreInv), r = q.length();
+    if (r < 1e-6) return 1;
+    const R = oreRadius(q.clone().divideScalar(r));
+    return r < R ? gradeLocal(q, r, R) : 0;
+  }
+  const gradeRGB = GRADE_COLORS.map((h) => new THREE.Color(h));
+  function gradeColor(g, out) { const x = clamp((g - 0.25) / 0.75) * 3, i = Math.min(2, Math.floor(x)); return out.copy(gradeRGB[i]).lerp(gradeRGB[i + 1], x - i); }
+  // 某一品位等值面：沿每个方向迭代求半径
+  function shellGeo(level, detail) {
+    let g = new THREE.IcosahedronGeometry(1, detail); g.deleteAttribute('normal'); g.deleteAttribute('uv');
+    g = mergeVertices(g);
+    const p = g.attributes.position, d = new THREE.Vector3(), q = new THREE.Vector3();
+    for (let i = 0; i < p.count; i++) {
+      d.fromBufferAttribute(p, i).normalize();
+      const R = oreRadius(d); let r = R * (1 - (level - 0.25) / 0.75);
+      if (level > 0.25) for (let it = 0; it < 4; it++) { q.copy(d).multiplyScalar(r); r = R * (1 - (level - 0.25 - (gradeLocal(q, r, R) - (0.25 + 0.75 * (1 - r / R)))) / 0.75); }
+      p.setXYZ(i, d.x * r, d.y * r, d.z * r);
+    }
+    g.computeVertexNormals();
+    return g;
+  }
+  // 品位壳着色（自定义着色器）：
+  //  - 外面两层（边界/中品位）半透明：边缘(菲涅尔)亮、中间透，再加一圈圈水平“品位等值线”，看得出是立体的壳，并能透过它看到内核
+  //  - 富矿核实心：有明暗（亮面/暗面/高光/轮廓光），表面颜色随品位起伏（红 → 紫红），并有发光的金色矿脉网
+  const NOISE_GLSL = `
+    float hash3(vec3 p){ p = fract(p * 0.3183099 + 0.1); p *= 17.0; return fract(p.x * p.y * p.z * (p.x + p.y + p.z)); }
+    float vnoise(vec3 x){ vec3 i = floor(x), f = fract(x); f = f * f * (3.0 - 2.0 * f);
+      return mix(mix(mix(hash3(i), hash3(i + vec3(1,0,0)), f.x), mix(hash3(i + vec3(0,1,0)), hash3(i + vec3(1,1,0)), f.x), f.y),
+                 mix(mix(hash3(i + vec3(0,0,1)), hash3(i + vec3(1,0,1)), f.x), mix(hash3(i + vec3(0,1,1)), hash3(i + vec3(1,1,1)), f.x), f.y), f.z); }`;
+  const shellShader = {
+    vertexShader: `varying vec3 vN; varying vec3 vV; varying vec3 vW;
+      void main(){ vec4 w = modelMatrix * vec4(position, 1.0); vW = w.xyz; vec4 mv = viewMatrix * w; vV = -mv.xyz; vN = normalMatrix * normal; gl_Position = projectionMatrix * mv; }`,
+    fragmentShader: `uniform vec3 uColor; uniform vec3 uColor2; uniform vec3 uVeinColor; uniform vec3 uLight; uniform float uOpacity; uniform float uCore;
+      varying vec3 vN; varying vec3 vV; varying vec3 vW;
+      ${NOISE_GLSL}
+      void main(){
+        vec3 n = normalize(vN), v = normalize(vV);
+        float ndv = abs(dot(n, v)), fres = pow(1.0 - ndv, 2.0);
+        float ndl = dot(n, uLight), wrap = clamp((ndl + 0.35) / 1.35, 0.0, 1.0);
+        vec4 outc;
+        if (uCore > 0.5) {
+          float g = vnoise(vW * 0.9) * 0.65 + vnoise(vW * 2.3 + 4.0) * 0.35;                       // 品位起伏
+          vec3 base = mix(uColor, uColor2, smoothstep(0.35, 0.75, g));
+          float r1 = 1.0 - abs(2.0 * vnoise(vW * vec3(0.8, 1.3, 0.8) + 9.0) - 1.0);                   // 脊状噪声 = 细脉
+          float vein = smoothstep(0.93, 0.985, r1);
+          vec3 h = normalize(uLight + v); float spec = pow(max(dot(n, h), 0.0), 40.0);
+          vec3 col = base * (0.1 + 0.7 * wrap) + vec3(1.0, 0.85, 0.7) * spec * 0.3 + uColor * fres * 0.35 + uVeinColor * vein * 1.3;
+          outc = vec4(col, uOpacity);
+        } else {
+          float band = smoothstep(0.82, 1.0, abs(sin(vW.y * 6.0)));                               // 品位等值线（每 ~0.5 单位一圈）
+          vec3 col = uColor * (0.35 + 0.6 * wrap) + uColor * fres * 0.9 + uColor * band * 0.5;
+          outc = vec4(col, uOpacity * clamp(0.18 + 0.85 * fres + 0.35 * band, 0.0, 1.0));
+        }
+        gl_FragColor = outc;
+        #include <tonemapping_fragment>
+        #include <colorspace_fragment>
+      }`,
+  };
+  // [品位, 细分, 不透明度, 是否实心核]
+  const SHELLS = [[0.25, 14, 0.55, 0], [0.48, 12, 0.7, 0], [0.68, 16, 1, 1]];
+  const ore = new THREE.Group();
+  ore.position.copy(ORE.pos); ore.scale.copy(ORE.scale); ore.rotation.copy(ORE.rot);
+  const shellMats = SHELLS.map(([lv, det, op, core], i) => {
+    const c = gradeColor(lv + 0.05, new THREE.Color());
+    const mat = new THREE.ShaderMaterial({
+      ...shellShader, transparent: true, depthWrite: !!core,
+      uniforms: { uColor: { value: c.clone() }, uColor2: { value: gradeRGB[3].clone() }, uVeinColor: { value: new THREE.Color(0xffc861) }, uLight: { value: new THREE.Vector3() }, uOpacity: { value: op }, uCore: { value: core } },
+    });
+    mat.userData.op = op;
+    const m = new THREE.Mesh(shellGeo(lv, det), mat); m.renderOrder = 5 - i; ore.add(m);
+    return mat;
+  });
+  scene.add(ore);
+  // 假泛光：矿体后面一层加色光晕
+  const oreHalo = new THREE.Sprite(new THREE.SpriteMaterial({ map: radialTex([[0, 'rgba(255,150,60,0.7)'], [0.45, 'rgba(255,90,40,0.18)'], [1, 'rgba(255,60,30,0)']]), blending: THREE.AdditiveBlending, depthWrite: false, transparent: true, fog: false }));
+  oreHalo.position.copy(ORE.pos); oreHalo.scale.set(9, 5.5, 1); oreHalo.renderOrder = 2; scene.add(oreHalo);
+
+  // ---------- 地表贴图：高程配色 + 林地 + 陡坡露岩 + 山体明暗（烘焙）+ 等高线 + 钻机场地与道路 ----------
+  const TT = 1024, UPT = SIZE / TT; // 地表贴图分辨率
+  const treeTile = tileCanvas(256, 'rgba(0,0,0,0)', (g, wrap, r) => {
+    g.clearRect(0, 0, 256, 256);
+    for (let i = 0; i < 900; i++) {
+      const x = r() * 256, y = r() * 256, s = 1.6 + r() * 2.2, l = 16 + r() * 14;
+      wrap((g) => { g.fillStyle = 'rgba(10,18,8,0.55)'; g.beginPath(); g.arc(x + s * 0.5, y + s * 0.5, s, 0, 7); g.fill(); g.fillStyle = `hsl(${95 + r() * 30},38%,${l}%)`; g.beginPath(); g.arc(x, y, s, 0, 7); g.fill(); g.fillStyle = `hsla(80,40%,${l + 14}%,0.7)`; g.beginPath(); g.arc(x - s * 0.3, y - s * 0.3, s * 0.45, 0, 7); g.fill(); });
+    }
+  });
+  const lineData = new Uint8Array(TT * TT); // 等高线遮罩（透视阶段地表只剩等高线）
+  const terrainTex = (() => {
+    const c = document.createElement('canvas'); c.width = c.height = TT;
+    const g = c.getContext('2d'), img = g.createImageData(TT, TT), d = img.data;
+    const MEAD = hexRGB('#7a8c55'), DRY = hexRGB('#a59c70'), ROCK = hexRGB('#978d7e'), SCREE = hexRGB('#bdb5a4');
+    const lx = sunDir.x, lz = sunDir.z, CI = 0.35; // CI：等高距（单位）
+    for (let py = 0; py < TT; py++) for (let px = 0; px < TT; px++) {
+      const x = -HALF + (px + 0.5) * UPT, z = -HALF + (py + 0.5) * UPT, o = (py * TT + px) * 4;
+      const h = bil(hgrid, x, z), hx = (bil(hgrid, x + 0.08, z) - bil(hgrid, x - 0.08, z)) / 0.16, hz = (bil(hgrid, x, z + 0.08) - bil(hgrid, x, z - 0.08)) / 0.16;
+      const slope = Math.hypot(hx, hz), n = nz(px * 0.7, py * 0.7), n2v = nz(px * 2.3 + 50, py * 2.3);
+      const e = clamp((h - 0.2) / 3.4);
+      let r = lerp(MEAD[0], DRY[0], smooth(0.2, 0.7, e + 0.25 * (n - 0.5))), gg = lerp(MEAD[1], DRY[1], smooth(0.2, 0.7, e + 0.25 * (n - 0.5))), b = lerp(MEAD[2], DRY[2], smooth(0.2, 0.7, e + 0.25 * (n - 0.5)));
+      // 陡坡/高处：露岩，带顺等高线的岩层台坎条纹
+      const rk = clamp(smooth(0.45, 0.85, slope + 0.3 * (n2v - 0.5)) + smooth(0.75, 1.0, e) * 0.8);
+      if (rk > 0) {
+        const ledge = 0.88 + 0.16 * Math.sin(h * 26 + n2v * 3);
+        const rr = lerp(ROCK[0], SCREE[0], n2v) * ledge, rg = lerp(ROCK[1], SCREE[1], n2v) * ledge, rb = lerp(ROCK[2], SCREE[2], n2v) * ledge;
+        r = lerp(r, rr, rk); gg = lerp(gg, rg, rk); b = lerp(b, rb, rk);
+      }
+      // 林地：缓坡低处成片树冠
+      const fm = smooth(0.05, 0.35, bil(fgrid, x, z)) * (1 - smooth(0.35, 0.6, slope)) * (1 - smooth(0.55, 0.8, e));
+      if (fm > 0) { const k = (((py & 255) * 256) + (px & 255)) * 4, ta = treeTile[k + 3] / 255 * fm; r = lerp(r, treeTile[k], ta); gg = lerp(gg, treeTile[k + 1], ta); b = lerp(b, treeTile[k + 2], ta); }
+      // 山体明暗（烘焙主光：向阳坡亮、背阴坡暗）+ 微地形明暗 + 细颗粒
+      const ndl = (-hx * sunDir.x + sunDir.y - hz * sunDir.z) / Math.hypot(hx, 1, hz);
+      const dn = (nz(px * 2.3 + 51, py * 2.3) - nz(px * 2.3 + 49, py * 2.3)) * lx + (nz(px * 2.3 + 50, py * 2.3 + 1) - nz(px * 2.3 + 50, py * 2.3 - 1)) * lz;
+      let m = (0.3 + 0.82 * clamp(ndl)) * (1 + 3.5 * dn + 0.08 * (hash2(px, py) - 0.5));
+      // 等高线：每 CI 一条细线，每 5 条一条计曲线
+      const ci = h / CI, fr = Math.abs(ci - Math.round(ci)) * CI / Math.max(slope * UPT, 1e-4);
+      const major = Math.round(ci) % 5 === 0;
+      const ln = major ? 1 - smooth(0.8, 1.6, fr) : 1 - smooth(0.5, 1.1, fr);
+      m *= 1 - ln * (major ? 0.38 : 0.2);
+      lineData[py * TT + px] = ln * (major ? 255 : 150);
+      d[o] = r * m; d[o + 1] = gg * m; d[o + 2] = b * m; d[o + 3] = 255;
+    }
+    g.putImageData(img, 0, 0);
+    // 钻机场地（平整碎石场，土黄灰，不是白块）+ 连接道路（土路：深色路肩 + 浅色路面）
+    const toPx = (x, z) => [((x + HALF) / SIZE) * TT, ((z + HALF) / SIZE) * TT];
+    const roadZ = (x) => 0.6 + 3.2 * Math.sin(x * 0.28 + 0.4);  // 主路走向（单位坐标），各钻机场地有支路接到主路
+    const pads = HOLE_DEFS.map(([x, z]) => toPx(x, z));
+    const path = []; for (let x = -HALF; x <= HALF; x += 0.25) path.push(toPx(x, roadZ(x)));
+    const spurs = HOLE_DEFS.map(([x, z]) => [toPx(x, z), toPx(x + (z - roadZ(x)) * 0.25, roadZ(x))]);
+    g.lineCap = 'round'; g.lineJoin = 'round';
+    for (const [w, col] of [[9, 'rgba(48,38,28,0.6)'], [5, 'rgba(150,134,104,0.95)']]) {
+      g.strokeStyle = col; g.lineWidth = w; g.beginPath(); path.forEach(([x, y], i) => (i ? g.lineTo(x, y) : g.moveTo(x, y)));
+      for (const [[ax, ay], [bx, by]] of spurs) { g.moveTo(ax, ay); g.lineTo(bx, by); }
+      g.stroke();
+    }
+    const r = mulberry32(SEED + 5);
+    for (const [x, y] of pads) {
+      g.fillStyle = 'rgba(40,32,24,0.7)'; g.fillRect(x - 20, y - 18, 42, 40);         // 场地阴影边
+      g.fillStyle = '#8f8676'; g.fillRect(x - 18, y - 18, 36, 36);                  // 碎石场
+      for (let i = 0; i < 90; i++) { g.fillStyle = r() < 0.5 ? 'rgba(60,52,42,0.5)' : 'rgba(170,160,140,0.5)'; g.fillRect(x - 18 + r() * 35, y - 18 + r() * 35, 1.5, 1.5); }
+      g.fillStyle = 'rgba(70,90,120,0.6)'; g.fillRect(x + 6, y - 15, 9, 6);           // 泥浆池
+    }
+    const t = new THREE.CanvasTexture(c); t.colorSpace = THREE.SRGBColorSpace;
+    return t;
+  })();
+  const lineTex = new THREE.DataTexture(lineData, TT, TT, THREE.RedFormat); lineTex.magFilter = lineTex.minFilter = THREE.LinearFilter; lineTex.needsUpdate = true;
+  // AI 预测靶区：概率热力 + 等值线（与矿体在地表投影的距离 + 一点噪声）
+  const heatTex = (() => {
+    const S = 512, c = document.createElement('canvas'); c.width = c.height = S;
+    const g = c.getContext('2d'), img = g.createImageData(S, S), d = img.data, oc = ORE.pos, hc = new THREE.Color(), lo = new THREE.Color(1, 0.85, 0.3), hi = new THREE.Color(0.95, 0.12, 0.1);
+    const prob = (x, z) => { const dd = Math.hypot((x - oc.x) / 5.5, (z - oc.z) / 3.6); return clamp(Math.exp(-dd * dd * 0.8) + 0.12 * n2(x * 0.3, z * 0.3 + 9)); };
+    for (let py = 0; py < S; py++) for (let px = 0; px < S; px++) {
+      const x = -HALF + ((px + 0.5) / S) * SIZE, z = -HALF + ((py + 0.5) / S) * SIZE, o = (py * S + px) * 4;
+      const pr = prob(x, z), e = 0.04, gx = (prob(x + e, z) - prob(x - e, z)) / (2 * e), gz = (prob(x, z + e) - prob(x, z - e)) / (2 * e);
+      hc.copy(lo).lerp(hi, pr);
+      let a = smooth(0.12, 0.45, pr) * 0.8;
+      const lv = pr / 0.2, fr = Math.abs(lv - Math.round(lv)) * 0.2 / Math.max(Math.hypot(gx, gz) * (SIZE / S), 1e-4);
+      if (pr > 0.15 && pr < 0.97 && fr < 0.9) { hc.lerp(new THREE.Color(1, 1, 1), 0.85); a = Math.max(a, 0.95); } // 概率等值线
+      d[o] = hc.r * 255; d[o + 1] = hc.g * 255; d[o + 2] = hc.b * 255; d[o + 3] = a * 255;
+    }
+    g.putImageData(img, 0, 0);
+    const t = new THREE.CanvasTexture(c); t.colorSpace = THREE.SRGBColorSpace; return t;
+  })();
+  const heatU = { value: 0 }, xrayU = { value: 0 };
+  const terrainMat = new THREE.MeshBasicMaterial({ map: terrainTex, transparent: true });
+  // 地表着色补丁：叠加靶区热力（uHeat 控制淡入）；透视时（uXray）地表变成只剩淡蓝等高线的“玻璃”，不再糊住下面的剖面
+  terrainMat.onBeforeCompile = (sh) => {
+    Object.assign(sh.uniforms, { uHeat: heatU, uXray: xrayU, heatMap: { value: heatTex }, lineMap: { value: lineTex } });
+    sh.fragmentShader = sh.fragmentShader
+      .replace('void main() {', 'uniform float uHeat; uniform float uXray; uniform sampler2D heatMap; uniform sampler2D lineMap;\nvoid main() {')
+      .replace('#include <map_fragment>', `#include <map_fragment>
+        if (uHeat > 0.0) { vec4 hz = texture2D(heatMap, vMapUv); diffuseColor.rgb = mix(diffuseColor.rgb, hz.rgb * 1.25, hz.a * uHeat); }
+        if (uXray > 0.0) { float ln = texture2D(lineMap, vMapUv).r; diffuseColor.rgb = mix(diffuseColor.rgb, vec3(0.62, 0.8, 1.0), uXray); diffuseColor.a *= mix(1.0, 0.04 + 0.6 * ln, uXray); }`);
+  };
+  terrainMat.toneMapped = false; // 烘焙好的颜色直接显示
+  const terrain = new THREE.Mesh(terrainGeo, terrainMat);
+  scene.add(terrain);
+  for (const w of walls) w.material.toneMapped = false;
+  floor.material.toneMapped = false;
+  // 块体轮廓线：四条竖棱 + 底框 + 顶部地形边缘（技术图样的精确感）
+  {
+    const pts = [];
+    for (const [cx, cz] of [[-HALF, -HALF], [HALF, -HALF], [HALF, HALF], [-HALF, HALF]]) pts.push(cx, BOTTOM, cz, cx, heightAt(cx, cz), cz);
+    const sides = [[-HALF, HALF, HALF, HALF], [HALF, HALF, HALF, -HALF], [HALF, -HALF, -HALF, -HALF], [-HALF, -HALF, -HALF, HALF]];
+    for (const [ax, az, bx, bz] of sides) {
+      pts.push(ax, BOTTOM, az, bx, BOTTOM, bz);
+      for (let i = 0; i < 64; i++) { const s0 = i / 64, s1 = (i + 1) / 64, x0 = lerp(ax, bx, s0), z0 = lerp(az, bz, s0), x1 = lerp(ax, bx, s1), z1 = lerp(az, bz, s1); pts.push(x0, heightAt(x0, z0) + 0.01, z0, x1, heightAt(x1, z1) + 0.01, z1); }
+    }
+    const g = new THREE.BufferGeometry(); g.setAttribute('position', new THREE.Float32BufferAttribute(pts, 3));
+    scene.add(new THREE.LineSegments(g, new THREE.LineBasicMaterial({ color: 0xcfe2f5, transparent: true, opacity: 0.7, fog: false })));
+  }
+
+  // ---------- 钻孔：套管 + 岩芯（按岩性/品位分段着色）+ 钻机 ----------
+  const HOLES = [], SEGS = 48, RAD = 8;
+  const steel = new THREE.MeshPhongMaterial({ color: 0xc9d3dc, specular: 0xffffff, shininess: 60 });
+  const mastMat = new THREE.MeshPhongMaterial({ color: 0xff7a1a, specular: 0x666666, shininess: 30 });
+  const padMat = new THREE.MeshLambertMaterial({ color: 0x5d636b });
+  const cabMat = new THREE.MeshPhongMaterial({ color: 0x2f7fd6, specular: 0x888888, shininess: 40 });
+  const bitMat = new THREE.MeshBasicMaterial({ color: 0xfff3d6 });
+  const glowTex = radialTex([[0, 'rgba(255,240,200,1)'], [0.25, 'rgba(255,170,80,0.55)'], [1, 'rgba(255,120,40,0)']], 64);
+  const up = new THREE.Vector3(0, 1, 0), tmpC = new THREE.Color();
+  const LABEL_H = W > H ? 1.3 : 1.75; // 钻孔标签高度（世界单位）：480p 下约 20+ 像素高（竖版块体显得小，标签放大）
+  const holeLabelStyle = { px: 44, color: '#eaf4ff', accent: '#3fa7ff' }, hitLabelStyle = { px: 44, color: '#ffe3a8', accent: '#ffb347', border: 'rgba(255,190,90,0.7)' };
+  HOLE_DEFS.forEach(([x, z, az, dip, len], k) => {
+    const top = new THREE.Vector3(x, heightAt(x, z), z);
+    const dr = THREE.MathUtils.degToRad(dip);
+    const dir = new THREE.Vector3(Math.cos(az) * Math.cos(dr), -Math.sin(dr), Math.sin(az) * Math.cos(dr));
+    const end = top.clone().addScaledVector(dir, len);
+    if (end.y < BOTTOM + 0.3) end.copy(top).addScaledVector(dir, (top.y - BOTTOM - 0.3) / Math.sin(dr));
+    // 岩芯色带：一维贴图（沿孔深 512 格），岩层 = 岩性色提亮，见矿 = 品位色并自发光，每 1 单位一条岩芯箱分隔线
+    const N = 512, cc = document.createElement('canvas'), ce = document.createElement('canvas'); cc.width = ce.width = N; cc.height = ce.height = 1;
+    const gc = cc.getContext('2d'), ge = ce.getContext('2d'), ic = gc.createImageData(N, 1), ie = ge.createImageData(N, 1), p = new THREE.Vector3(), L = top.distanceTo(end);
+    let firstHit = -1;
+    const rgb = {}, white = new THREE.Color(1, 1, 1);
+    for (let i = 0; i < N; i++) {
+      p.lerpVectors(top, end, (i + 0.5) / N);
+      const gr = gradeAt(p), o = i * 4, box = ((i / N) * L) % 1 < 0.035 ? 0.4 : 1;
+      if (gr > 0) {
+        gradeColor(gr, tmpC).getRGB(rgb, THREE.SRGBColorSpace); if (firstHit < 0) firstHit = i / N;
+        ie.data.set([rgb.r * 255, rgb.g * 255, rgb.b * 255, 255], o);
+      } else {
+        const ly = layerAt(p.x, p.y, p.z), base = ly < 0 ? SOIL_RGB : LITHO[ly].rgb;
+        tmpC.setRGB(base[0] / 255, base[1] / 255, base[2] / 255, THREE.SRGBColorSpace).lerp(white, 0.3).getRGB(rgb, THREE.SRGBColorSpace);
+        ie.data.set([0, 0, 0, 255], o);
+      }
+      ic.data.set([rgb.r * 255 * box, rgb.g * 255 * box, rgb.b * 255 * box, 255], o);
+    }
+    gc.putImageData(ic, 0, 0); ge.putImageData(ie, 0, 0);
+    const mapT = new THREE.CanvasTexture(cc), emT = new THREE.CanvasTexture(ce);
+    mapT.colorSpace = emT.colorSpace = THREE.SRGBColorSpace;
+    const geo = new THREE.TubeGeometry(new THREE.LineCurve3(top, end), SEGS, 0.14, RAD, false);
+    const mesh = new THREE.Mesh(geo, new THREE.MeshLambertMaterial({ map: mapT, emissiveMap: emT, emissive: 0xffffff, emissiveIntensity: 0.9 }));
+    scene.add(mesh);
+    // 套管：孔口一段钢管
+    const casing = new THREE.Mesh(new THREE.CylinderGeometry(0.21, 0.21, 1.3, 14, 1, false), steel);
+    casing.quaternion.setFromUnitVectors(up, dir.clone().negate()); casing.position.copy(top).addScaledVector(dir, 0.45);
+    scene.add(casing);
+    // 钻头：亮点 + 光晕
+    const bit = new THREE.Mesh(new THREE.SphereGeometry(0.17, 12, 8), bitMat); scene.add(bit);
+    const bitGlow = new THREE.Sprite(new THREE.SpriteMaterial({ map: glowTex, blending: THREE.AdditiveBlending, depthWrite: false, depthTest: false, transparent: true, fog: false }));
+    bitGlow.scale.setScalar(0.9); bitGlow.renderOrder = 15; scene.add(bitGlow);
+    // 钻机：场地底座 + 沿孔向倾斜的井架 + 机房
+    const rig = new THREE.Group(); rig.position.copy(top);
+    const pad = new THREE.Mesh(new THREE.BoxGeometry(0.85, 0.08, 0.85), padMat); pad.position.y = 0.02; rig.add(pad);
+    const mast = new THREE.Mesh(new THREE.BoxGeometry(0.1, 1.7, 0.1), mastMat);
+    mast.quaternion.setFromUnitVectors(up, dir.clone().negate()); mast.position.copy(dir).multiplyScalar(-0.85); rig.add(mast);
+    const crown = new THREE.Mesh(new THREE.BoxGeometry(0.22, 0.12, 0.22), mastMat); crown.position.copy(dir).multiplyScalar(-1.7); rig.add(crown);
+    const cab = new THREE.Mesh(new THREE.BoxGeometry(0.34, 0.26, 0.3), cabMat);
+    const side = new THREE.Vector3(-Math.sin(az), 0, Math.cos(az)); cab.position.copy(side).multiplyScalar(0.32); cab.position.y = 0.17; rig.add(cab);
+    scene.add(rig);
+    // 标签：见矿后换成金色版
+    const name = `ZK${String(k + 1).padStart(2, '0')}`;
+    const label = makeLabel(name, { ...holeLabelStyle, height: LABEL_H });
+    const hitTex = labelCanvas(name, hitLabelStyle);
+    label.position.copy(top); scene.add(label);
+    const lead = new THREE.Line(new THREE.BufferGeometry().setFromPoints([new THREE.Vector3(0, 0.25, 0), new THREE.Vector3(0, 1, 0)]),
+      new THREE.LineBasicMaterial({ color: 0xcfe4ff, transparent: true, opacity: 0, depthTest: false, fog: false }));
+    lead.position.copy(top); lead.renderOrder = 19; scene.add(lead);
+    HOLES.push({ mesh, bit, bitGlow, rig, casing, label, hitTex, baseTex: label.material.map, lead, top, end, firstHit, start: HOLE_FIRST + k * HOLE_GAP, lift: 2 });
+  });
+  const oreLabel = makeLabel('隐伏矿体', { px: 52, height: 1.5, color: '#ffd27a', border: 'rgba(255,190,90,0.8)' });
+  oreLabel.center.set(0.5, 0.5); oreLabel.position.copy(ORE.pos).add(new THREE.Vector3(0, -ORE.scale.y - 1.2, 0)); scene.add(oreLabel);
+  const aiLabel = makeLabel('AI 预测靶区', { px: 52, height: 1.5, color: '#ffffff', bg: 'rgba(200,40,30,0.88)', border: 'rgba(255,255,255,0.6)' });
+  aiLabel.position.set(ORE.pos.x, heightAt(ORE.pos.x, ORE.pos.z) + 1.6, ORE.pos.z); scene.add(aiLabel);
+
+  // ---------- 相机：环绕 + 降低机位；每帧自动算距离和画面偏移，让块体正好落在留给它的区域里（横竖版都不出画、不留大片空地） ----------
+  const camera = new THREE.PerspectiveCamera(30, W / H, 0.1, 200);
+  const target = new THREE.Vector3(0, (BOTTOM + TOPY) / 2, 0);
+  // 留给块体的屏幕区域 [左, 右, 上, 下]（占画面比例）：横版让出左侧标题和图例；竖版让出顶部标题、底部图例和字幕
+  const AREA = W > H ? [0.34, 0.97, 0.17, 0.94] : [0.03, 0.97, 0.29, 0.74];
+  const BOX = [];
+  for (const x of [-HALF, HALF]) for (const z of [-HALF, HALF]) for (const y of [BOTTOM, TOPY]) BOX.push(new THREE.Vector3(x, y, z));
+  const camDir = new THREE.Vector3(), pv = new THREE.Vector3();
+  function placeCamera(t) {
+    const p = easeInOut(seg(t, 0, DURATION));
+    const az = lerp(CAM.az[0], CAM.az[1], p), el = lerp(CAM.el[0], CAM.el[1], easeInOut(seg(t, 0.8, 4.4))), fill = lerp(CAM.fill[0], CAM.fill[1], p);
+    camDir.set(Math.cos(el) * Math.sin(az), Math.sin(el), Math.cos(el) * Math.cos(az));
+    camera.clearViewOffset();
+    let dist = 50, bb;
+    for (let it = 0; it < 5; it++) {
+      camera.position.copy(target).addScaledVector(camDir, dist); camera.lookAt(target); camera.updateMatrixWorld();
+      bb = [1e9, -1e9, 1e9, -1e9];
+      for (const c of BOX) { pv.copy(c).project(camera); bb[0] = Math.min(bb[0], pv.x); bb[1] = Math.max(bb[1], pv.x); bb[2] = Math.min(bb[2], pv.y); bb[3] = Math.max(bb[3], pv.y); }
+      const k = Math.max(((bb[1] - bb[0]) / 2) / ((AREA[1] - AREA[0]) * fill), ((bb[3] - bb[2]) / 2) / ((AREA[3] - AREA[2]) * fill));
+      dist *= k;
+    }
+    // 块体包围框中心 → 区域中心（像素）
+    const cx = ((bb[0] + bb[1]) / 4 + 0.5) * W, cy = (0.5 - (bb[2] + bb[3]) / 4) * H;
+    camera.setViewOffset(W, H, cx - ((AREA[0] + AREA[1]) / 2) * W, cy - ((AREA[2] + AREA[3]) / 2) * H, W, H);
+    camera.updateMatrixWorld();
+    scene.fog.near = dist * 0.9; scene.fog.far = dist * 2.4;
+    return dist;
+  }
+  // 钻孔标签自动排布：在镜头后半段取样，给每根孔的标签挑一个位置（4 档高度 × 引线居中/在左/在右），
+  // 让标签之间、标签与左上角标题之间互相遮挡最少、且不出画（多起点逐个优化，只在准备阶段算一次）
+  {
+    const LIFTS = [1.6, 2.7, 3.8, 4.9], SIDES = [0.5, 0.07, 0.93], OPTS = [], S = [], N = HOLES.length;
+    for (const lf of LIFTS) for (const sd of SIDES) OPTS.push([lf, sd]);
+    for (let t = HOLE_FIRST + 0.6; t < DURATION; t += 0.4) S.push(t);
+    S.push(DURATION);
+    const HUD = W > H ? [0, 0.42 * W, 0, 0.25 * H] : [0, W, 0, 0.18 * H]; // 标题 + 副标题 + 统计框占的区域
+    const area = (A, B) => { const ox = Math.min(A[1], B[1]) - Math.max(A[0], B[0]), oy = Math.min(A[3], B[3]) - Math.max(A[2], B[2]); return ox > 0 && oy > 0 ? ox * oy : 0; };
+    const camUp = new THREE.Vector3();
+    const rects = S.map((t) => { // rects[样本][孔][选项] = 屏幕矩形 [左, 右, 上, 下]（像素，留 4px 间隙）
+      placeCamera(t); camUp.set(0, 1, 0).applyQuaternion(camera.quaternion);
+      return HOLES.map((h) => OPTS.map(([lf, sd]) => {
+        pv.copy(h.top); pv.y += lf;
+        const b = pv.clone().project(camera), c2 = pv.addScaledVector(camUp, LABEL_H).project(camera);
+        const hh = (c2.y - b.y) * H / 2, ww = hh * h.label.userData.aspect, x = (b.x + 1) / 2 * W, y = (1 - b.y) / 2 * H;
+        return [x - ww * sd - 4, x + ww * (1 - sd) + 4, y - hh - 4, y + 4];
+      }));
+    });
+    // 单个标签自身的代价：出画、压到标题区；略偏好低标签、居中（引线短、整齐）
+    const self = OPTS.map((o, oi) => HOLES.map((_, k) => S.reduce((c, _, s) => { const q = rects[s][k][oi];
+      return c + area(q, HUD) + Math.max(0, 0.03 * H - q[2]) * (q[1] - q[0]) + Math.max(0, -q[0]) * 60 + Math.max(0, q[1] - W) * 60; }, 0) + Math.floor(oi / SIDES.length) * 6 + (oi % SIDES.length ? 10 : 0)));
+    const cost = (pick) => {
+      let c = 0;
+      for (let k = 0; k < N; k++) c += self[pick[k]][k];
+      for (let s = 0; s < S.length; s++) for (let i = 0; i < N; i++) for (let j = i + 1; j < N; j++) c += area(rects[s][i][pick[i]], rects[s][j][pick[j]]);
+      return c;
+    };
+    const rnd = mulberry32(SEED + 9);
+    let best = Infinity, bestPick = null;
+    for (let start = 0; start < 30; start++) {
+      const pick = HOLES.map((_, k) => (start === 0 ? (k % LIFTS.length) * SIDES.length : (rnd() * OPTS.length) | 0));
+      let cur = cost(pick);
+      for (let pass = 0, moved = true; pass < 8 && moved; pass++) {
+        moved = false;
+        for (let k = 0; k < N; k++) for (let o = 0; o < OPTS.length; o++) {
+          if (o === pick[k]) continue;
+          const old = pick[k]; pick[k] = o; const c = cost(pick);
+          if (c < cur - 1e-6) { cur = c; moved = true; } else pick[k] = old;
+        }
+      }
+      if (cur < best) { best = cur; bestPick = pick.slice(); }
+    }
+    HOLES.forEach((h, k) => { const [lf, sd] = OPTS[bestPick[k]]; h.lift = lf; h.label.position.y = h.top.y + lf; h.label.center.x = sd; h.lead.scale.y = lf; });
+  }
+
+  const hudStat = document.getElementById('stat'), hudTitle = document.getElementById('title'), hudSub = document.getElementById('sub'), hudLegend = document.getElementById('legend');
+  const toCam = new THREE.Vector3();
+
+  draw = (t) => {
+    // 4) 相机（先算相机，侧壁明暗和透明排序要用）
+    placeCamera(t);
+    // 1) AI 靶区热力在地表淡入；透视开始后热力和靶区标签退场，把舞台让给矿体
+    const heat = easeInOut(seg(t, T_HEAT[0], T_HEAT[1]));
+    const xray = easeInOut(seg(t, T_XRAY[0], T_XRAY[1]));
+    heatU.value = heat * (1 - xray);
+    aiLabel.material.opacity = heat * (1 - seg(t, T_XRAY[0], T_XRAY[0] + 0.5));
+    aiLabel.visible = aiLabel.material.opacity > 0.01;
+    // 2) 透视：朝向相机的两面侧壁淡出，地表只剩等高线，背面两壁保留剖面作背景，露出矿体和钻孔
+    xrayU.value = xray;
+    terrainMat.depthWrite = xray < 0.01; terrain.renderOrder = 8;
+    for (const w of walls) {
+      const near = smooth(-0.2, 0.25, toCam.copy(camera.position).sub(w.userData.center).normalize().dot(w.userData.normal));
+      // 背面两壁在透视前被挡住，不画（省一层）；朝向相机的壁淡出直到隐藏，只留轮廓线
+      w.material.opacity = near > 0.5 ? 1 - xray : xray;
+      w.visible = w.material.opacity > 0.01;
+      w.material.depthWrite = w.material.opacity > 0.99;
+      w.material.color.setScalar(lerp(WALL_SHADE.inside, w.userData.outside, near));
+      w.renderOrder = near < 0.5 ? 1 : 7;
+    }
+    floor.visible = ore.visible = xray > 0.01;
+    const lv = sunDir.clone().transformDirection(camera.matrixWorldInverse);
+    shellMats.forEach((m) => { m.uniforms.uLight.value.copy(lv); m.uniforms.uOpacity.value = m.userData.op * xray; });
+    oreHalo.material.opacity = 0.35 * xray;
+    oreLabel.material.opacity = easeOut(seg(t, 3.1, 3.7));
+    // 3) 钻孔逐根钻进
+    let hits = 0;
+    for (const h of HOLES) {
+      const prog = easeInOut(seg(t, h.start, h.start + DRILL_TIME));
+      const n = Math.floor(prog * SEGS);
+      h.mesh.geometry.setDrawRange(0, n * RAD * 6);
+      h.mesh.visible = n > 0;
+      const drilling = prog > 0 && prog < 1;
+      h.bit.visible = h.bitGlow.visible = drilling;
+      h.bit.position.lerpVectors(h.top, h.end, prog); h.bitGlow.position.copy(h.bit.position);
+      h.bitGlow.material.opacity = 0.9 * xray;
+      const appear = easeOut(seg(t, h.start - 0.4, h.start));
+      h.rig.scale.setScalar(Math.max(appear, 0.001)); h.casing.visible = appear > 0.5;
+      h.label.material.opacity = appear; h.lead.material.opacity = appear * 0.6;
+      h.label.visible = h.lead.visible = appear > 0.01;
+      const hit = h.firstHit >= 0 && prog >= h.firstHit;
+      h.label.material.map = hit ? h.hitTex : h.baseTex;
+      if (hit) hits++;
+    }
+    hudStat.textContent = t > HOLE_FIRST ? `钻孔见矿 ${hits} / ${HOLES.length}` : '';
+    // HUD
+    const a = easeOut(seg(t, 0.2, 1.0)), b = easeOut(seg(t, 0.6, 1.4));
+    hudTitle.style.opacity = a; hudTitle.style.transform = `translateY(${(1 - a) * 3}vmin)`;
+    hudSub.style.opacity = b; hudLegend.style.opacity = easeOut(seg(t, 3.0, 3.6));
+    renderer.render(scene, camera);
+  };
+  // 并行编译全部物体的着色器：先让所有物体可见（含透视阶段才出现的），再编译
+  scene.traverse((o) => { o.visible = true; });
+  await renderer.compileAsync(scene, camera);
+  draw(0);                                    // 预热一帧：上传贴图
+})();
+window.renderFrame = async (t) => { await window.sceneReady; draw(t); };
+</script>
+</body>
+</html>

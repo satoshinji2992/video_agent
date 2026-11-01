@@ -1,0 +1,491 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<!-- 产品转台（棚拍质感）：车削(Lathe)陶瓷瓶身（瓶底倒角、圆肩、瓶颈螺纹）+ 滚花拉丝金属瓶盖 + 正面烫金压纹标签 + 背面陶瓷丝印，
+     立在黑色亮面石台上（台面倒影 + 接触阴影），柔光箱环境光照，转台转一整圈（结尾标签正对镜头）+ 镜头缓慢推近 + 瓶盖旋开，标题用 HTML 叠层。 -->
+<style>
+  html, body { margin: 0; width: 100%; height: 100%; overflow: hidden; background: #07080b; }
+  /* 背景：棚拍无缝背景纸——产品后方一团柔光，四周压暗。全用 CSS，不占渲染时间 */
+  #bg { position: fixed; inset: 0; z-index: 0; background:
+    radial-gradient(46% 34% at 50% 42%, rgba(92, 108, 140, 0.55) 0%, rgba(52, 62, 84, 0.32) 42%, rgba(0, 0, 0, 0) 78%),
+    linear-gradient(180deg, #1a202c 0%, #121620 52%, #0a0c10 100%); }
+  canvas { display: block; position: fixed; inset: 0; z-index: 1; }
+  #vignette { position: fixed; inset: 0; z-index: 2; pointer-events: none; background: radial-gradient(75% 70% at 50% 45%, rgba(0, 0, 0, 0) 55%, rgba(0, 0, 0, 0.5) 100%); }
+  #hud { position: fixed; inset: 0; z-index: 3; font-family: "Noto Sans CJK SC", sans-serif; color: #fff; pointer-events: none; text-shadow: 0 0.3vmin 2vmin rgba(0, 0, 0, 0.45); }
+  #title { position: absolute; left: 8%; right: 8%; top: 8%; font-size: 7.2vmin; font-weight: 900; letter-spacing: 0.04em; }
+  #sub { position: absolute; left: 8%; right: 8%; top: calc(8% + 10vmin); font-size: 3.8vmin; font-weight: 500; color: #d5dbe8; letter-spacing: 0.06em; }
+  /* 横版：文字放左侧，产品在右侧（见 setViewOffset），背景柔光也跟到右侧 */
+  @media (min-aspect-ratio: 1/1) {
+    #title { top: 34%; right: 52%; font-size: 8vmin; } #sub { top: calc(34% + 12vmin); right: 52%; }
+    #bg { background:
+      radial-gradient(30% 50% at 69% 44%, rgba(92, 108, 140, 0.55) 0%, rgba(52, 62, 84, 0.32) 45%, rgba(0, 0, 0, 0) 80%),
+      linear-gradient(180deg, #1a202c 0%, #121620 52%, #0a0c10 100%); }
+    #vignette { background: radial-gradient(70% 80% at 60% 45%, rgba(0, 0, 0, 0) 50%, rgba(0, 0, 0, 0.55) 100%); }
+  }
+</style>
+<script type="importmap">
+{ "imports": { "three": "/vendor/three/build/three.module.js", "three/addons/": "/vendor/three/examples/jsm/" } }
+</script>
+</head>
+<body>
+<div id="bg"></div>
+<div id="vignette"></div>
+<div id="hud"><div id="title">新品 · 全新质感</div><div id="sub">一体成型瓶身 · 磨砂金属瓶盖</div></div>
+<script type="module">
+import * as THREE from 'three';
+
+// ================= 可改参数（一般只改这里） =================
+const DURATION = 6;                                 // 镜头秒数，按计划改
+const LABEL = {                                     // 瓶身标签上的字（画在贴图上，随瓶子转）
+  name: '精 华 液',                                  // 正面主名：大字，乳白印刷 + 压纹
+  latin: 'SERUM',                                   // 主名下的英文：烫金，字距拉开
+  spec: '30 ml · 植萃配方',                          // 正面规格一行
+  back: 'SERUM',                                    // 背面丝印大字（直接印在陶瓷上，深色字，转到背面也看得出是印刷）
+  fine: [                                           // 背面丝印小字：3 行以内、每行 12 字以内，480p 下才不糊成一片
+    '烟酰胺 · 透明质酸钠',
+    '洁面后取 2–3 滴',
+    '净含量 30 ml',
+  ],
+};
+const COLOR = {
+  body: '#efe8dc',     // 瓶身釉色（陶瓷，带清漆高光）
+  label: '#1b2335',    // 标签底色（背面丝印也用这个色）
+  ink: '#f4ecdc',      // 标签印刷字色
+  foil: '#d8b679',     // 烫金色：标签细线/英文、瓶盖、底座铜圈共用
+  plinth: '#4d4f55',   // 底座石材色（哑光灰石，和黑色亮面台面、铜圈拉开材质对比）
+};
+const LABEL_WRAP = 0.44;                            // 标签包住瓶身的比例（0.44 ≈ 正面 160°）：正对镜头时左右轮廓露出陶瓷，瓶身不会和深色背景糊在一起
+const TURNS = 1;                                    // 整个镜头转几圈（整数：开头和结尾标签正面都朝镜头）
+const REFLECT = 0.32;                               // 台面倒影强度 0..1（0 = 关掉倒影）
+
+// ---------- 准备阶段（异步）：先等字体，再同步建场景，最后编译着色器并预热一帧 ----------
+// 系统在逐帧截图前会 await window.sceneReady（最多 30 秒）；renderFrame 自己也会等它。
+let draw; // 逐帧绘制函数 draw(t)，准备完成后赋值
+window.sceneReady = (async () => {
+  // 系统字体（Noto Sans CJK SC）不走网络，但仍先 load，确保画布写中文时字体已就绪
+  await Promise.all(['400', '500', '700', '900'].map((w) => document.fonts.load(`${w} 64px "Noto Sans CJK SC"`, '中文A')));
+
+  // ---------- 通用：尺寸、时间工具 ----------
+  const W = innerWidth, H = innerHeight;            // 视口 = 画面尺寸（CSS 像素）
+  const clamp = (x, a = 0, b = 1) => Math.min(b, Math.max(a, x));
+  const seg = (t, a, b) => clamp((t - a) / (b - a)); // t 在 [a,b] 内的进度 0..1
+  const easeInOut = (x) => (x < 0.5 ? 4 * x * x * x : 1 - Math.pow(-2 * x + 2, 3) / 2);
+  const easeOut = (x) => 1 - Math.pow(1 - x, 3);
+  const lerp = (a, b, x) => a + (b - a) * x;
+  const smooth = (a, b, x) => { const k = clamp((x - a) / (b - a)); return k * k * (3 - 2 * k); };
+  function fitDistance(radius, cam) {               // 让半径为 radius 的球在横竖两个方向都放得下
+    const v = THREE.MathUtils.degToRad(cam.fov) / 2, h = Math.atan(Math.tan(v) * cam.aspect);
+    return radius / Math.sin(Math.min(v, h));
+  }
+  let seed = 7;                                     // 固定种子的随机数：每次渲染结果一致
+  const rand = () => ((seed = (seed * 16807) % 2147483647) / 2147483647);
+  function canvas2d(w, h) { const c = document.createElement('canvas'); c.width = w; c.height = h; return [c, c.getContext('2d', { willReadFrequently: true })]; }
+  // 车削体：profile 为 [x,y] 折线（从轴心底部往外、往上走，法线才朝外）；uv.v 改成按弧长分布，贴图不被拉伸
+  // phi0/phiLen：只车一段弧（标签、背面丝印用）。phi = 0 是物体的 +z 方向（正面），u 从左到右增大
+  function lathe(pts, segs, phi0 = 0, phiLen = Math.PI * 2) {
+    const g = new THREE.LatheGeometry(pts.map(([x, y]) => new THREE.Vector2(x, y)), segs, phi0, phiLen);
+    const L = [0];
+    for (let j = 1; j < pts.length; j++) L.push(L[j - 1] + Math.hypot(pts[j][0] - pts[j - 1][0], pts[j][1] - pts[j - 1][1]));
+    const uv = g.attributes.uv;
+    for (let i = 0; i <= segs; i++) for (let j = 0; j < pts.length; j++) uv.setY(i * pts.length + j, L[j] / L[L.length - 1]);
+    g.userData.vOf = (j) => L[j] / L[L.length - 1]; // 第 j 个轮廓点的 v
+    return g;
+  }
+  // 圆角折线：corners 为 [x,y,r]，r>0 的拐角用圆弧倒角（n 段），得到光滑的倒角/圆肩轮廓
+  function rounded(corners, n = 8) {
+    const out = [];
+    corners.forEach(([x, y, r], i) => {
+      if (!r || i === 0 || i === corners.length - 1) { out.push([x, y]); return; }
+      const [px, py] = corners[i - 1], [nx, ny] = corners[i + 1];
+      const a = Math.hypot(px - x, py - y), b = Math.hypot(nx - x, ny - y);
+      const d = Math.min(r, a / 2, b / 2);
+      const p0 = [x + ((px - x) / a) * d, y + ((py - y) / a) * d], p1 = [x + ((nx - x) / b) * d, y + ((ny - y) / b) * d];
+      for (let k = 0; k <= n; k++) { // 二次贝塞尔近似圆弧
+        const s = k / n, u = 1 - s;
+        out.push([u * u * p0[0] + 2 * u * s * x + s * s * p1[0], u * u * p0[1] + 2 * u * s * y + s * s * p1[1]]);
+      }
+    });
+    return out;
+  }
+  // 高度图（灰度画布）→ 法线贴图：做压纹、滚花用
+  function normalFromHeight(c, strength) {
+    const w = c.width, h = c.height, src = c.getContext('2d').getImageData(0, 0, w, h).data;
+    const [nc, ng] = canvas2d(w, h), img = ng.createImageData(w, h), d = img.data;
+    const H = (x, y) => src[(((y + h) % h) * w + ((x + w) % w)) * 4] / 255;
+    for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
+      const dx = (H(x + 1, y) - H(x - 1, y)) * strength, dy = (H(x, y + 1) - H(x, y - 1)) * strength;
+      const l = Math.hypot(dx, dy, 1), i = (y * w + x) * 4;
+      d[i] = (-dx / l * 0.5 + 0.5) * 255; d[i + 1] = (dy / l * 0.5 + 0.5) * 255; d[i + 2] = (1 / l * 0.5 + 0.5) * 255; d[i + 3] = 255;
+    }
+    ng.putImageData(img, 0, 0);
+    return new THREE.CanvasTexture(nc);
+  }
+
+  // ---------- 渲染器 ----------
+  // 系统以 2 倍像素渲染再缩小（超采样），所以必须 setPixelRatio(devicePixelRatio)；此时不需要再开 MSAA
+  const renderer = new THREE.WebGLRenderer({ antialias: devicePixelRatio < 2, alpha: true, stencil: true, preserveDrawingBuffer: true });
+  renderer.setPixelRatio(window.devicePixelRatio);
+  renderer.setSize(W, H);
+  renderer.setClearColor(0x000000, 0);              // 透明，露出 CSS 背景
+  renderer.toneMapping = THREE.ACESFilmicToneMapping;
+  renderer.toneMappingExposure = 1.1;
+  document.body.prepend(renderer.domElement);
+  // 各向异性过滤：让斜着看的标签字不糊。软件渲染下每级都很贵，4 已足够（超采样本身也在抗锯齿）
+  const maxAniso = Math.min(4, renderer.capabilities.getMaxAnisotropy());
+
+  const scene = new THREE.Scene();
+
+  window.__three = { renderer, scene };                          // 让系统统计三角形数和贴图数
+
+  // ---------- 灯光：自建"影棚"环境（暗房间 + 发光柔光箱/灯条），PMREM 预滤波后做反射和环境光 ----------
+  // 瓶身、瓶盖上那几条竖直高光就是这些灯条的倒影；改位置/亮度就是改布光。
+  function studio() {
+    const s = new THREE.Scene();
+    const room = new THREE.SphereGeometry(30, 32, 16), col = [];
+    for (let i = 0; i < room.attributes.position.count; i++) { // 房间：上亮下暗的深灰
+      const k = 0.012 + 0.05 * smooth(-10, 25, room.attributes.position.getY(i));
+      col.push(k, k * 1.05, k * 1.2);
+    }
+    room.setAttribute('color', new THREE.Float32BufferAttribute(col, 3));
+    s.add(new THREE.Mesh(room, new THREE.MeshBasicMaterial({ vertexColors: true, side: THREE.BackSide })));
+    const panel = (w, h, pos, intensity, tint = 0xffffff) => {
+      const m = new THREE.Mesh(new THREE.PlaneGeometry(w, h), new THREE.MeshBasicMaterial({ color: new THREE.Color(tint).multiplyScalar(intensity), side: THREE.DoubleSide }));
+      m.position.set(...pos); m.lookAt(0, 1, 0); s.add(m);
+    };
+    panel(7, 9, [-9, 7, 9], 6.5, 0xfff3e2);          // 主光柔光箱：左前上方，暖白
+    panel(1.4, 16, [-11, 4, -4], 9.0, 0xdfe8ff);      // 左后灯条：瓶身左缘的细长高光
+    panel(1.4, 16, [11, 4, -2], 7.0, 0xdfe8ff);       // 右后灯条：瓶身右缘的轮廓光
+    panel(10, 10, [0, 16, 2], 2.2);                   // 顶灯：瓶肩、瓶盖顶、台面的柔和亮面
+    panel(8, 3, [6, 0.5, 11], 2.2, 0xffe6cc);         // 右前低位补光（较弱：照亮底座侧面，保留暗部层次）
+    return s;
+  }
+  const pmrem = new THREE.PMREMGenerator(renderer);
+  // size 64：环境图分辨率。软件渲染下 PMREM 的耗时和它的平方成正比（256 要 3 秒以上），而这里只用来烘焙 matcap，64 已经够用
+  const envTex = pmrem.fromScene(studio(), 0.02, 0.1, 100, { size: 64 }).texture;
+  scene.environment = envTex;                       // 新加的 MeshStandard/Physical 物体也会被这套布光照亮
+  const CAM_AZ = 0.35;                              // 镜头方位角（弧度，绕 y 轴）；烘焙和相机共用
+
+  // ---------- 材质烘焙（性能关键）：用真实 PBR 材质在上面的影棚里渲染一个球，存成 matcap 贴图 ----------
+  // 软件渲染（无 GPU）下逐像素做 PBR 环境光照非常贵；环境固定、镜头方向几乎不变时，
+  // 查"同一材质的球面照片"(MeshMatcapMaterial) 和实时 PBR 看起来几乎一样，却便宜好几倍。
+  // 想改材质：改 bake({...}) 里的 MeshStandard/Physical 参数（color、roughness、metalness、clearcoat…）。
+  // 不要给 DirectionalLight：matcap 不受灯光影响，布光全在 studio() 里。
+  const bakeScene = new THREE.Scene();
+  bakeScene.environment = envTex;
+  const ball = new THREE.Mesh(new THREE.SphereGeometry(1, 96, 48));
+  bakeScene.add(ball);
+  const bakeCam = new THREE.OrthographicCamera(-1, 1, 1, -1, 0.1, 10);
+  bakeCam.position.set(Math.sin(CAM_AZ) * Math.cos(0.2), Math.sin(0.2), Math.cos(CAM_AZ) * Math.cos(0.2)).multiplyScalar(4); // 和镜头同方向看球
+  bakeCam.lookAt(0, 0, 0);
+  function bake(params, size = 256) {
+    const rt = new THREE.WebGLRenderTarget(size, size, { type: THREE.HalfFloatType }); // 线性 HDR，最终画面再统一色调映射
+    ball.material = params.clearcoat ? new THREE.MeshPhysicalMaterial(params) : new THREE.MeshStandardMaterial(params);
+    renderer.setRenderTarget(rt); renderer.render(bakeScene, bakeCam); renderer.setRenderTarget(null);
+    ball.material.dispose();
+    return rt.texture;
+  }
+  // 两张 matcap 按遮罩贴图的某个通道混合：标签（纸 / 烫金）、瓶盖（抛光 / 拉丝滚花）
+  function matcapMix(params, matcapB, mask, channel, lo, hi) {
+    const m = new THREE.MeshMatcapMaterial(params);
+    m.onBeforeCompile = (sh) => {
+      sh.uniforms.matcapB = { value: matcapB }; sh.uniforms.mixMask = { value: mask };
+      sh.fragmentShader = sh.fragmentShader.replace('uniform sampler2D matcap;', 'uniform sampler2D matcap, matcapB, mixMask;')
+        .replace('vec4 matcapColor = texture2D( matcap, uv );',
+          `vec4 matcapColor = mix(texture2D(matcap, uv), texture2D(matcapB, uv), smoothstep(${lo.toFixed(3)}, ${hi.toFixed(3)}, texture2D(mixMask, vNormalMapUv).${channel}));`);
+    };
+    m.customProgramCacheKey = () => `mix-${channel}-${lo}-${hi}`; // 不同参数要编译成不同的着色器
+    return m;
+  }
+  const WHITE = 0xffffff;
+  const mcMetalPolished = bake({ color: WHITE, metalness: 1, roughness: 0.14 });   // 抛光金属（颜色由材质 color 乘上去）
+  const mcMetalBrushed = bake({ color: WHITE, metalness: 1, roughness: 0.42 });    // 拉丝/滚花金属
+
+  // 渲染顺序（renderOrder）：-1 地面阴影 → 0 底座 → 1 台面（写模板）→ 2 台面倒影（只画在台面上）→ 3 标签/丝印 → 3.5 瓶身/瓶盖 → 4 台面光泽/接触阴影
+  // ---------- 分段数：软件渲染下每个三角形都有固定开销（约 1 微秒），所以只给轮廓需要的段数 ----------
+  // 480p×2 超采样时，瓶身半径约 160 像素，64 段的多边形边缘误差 < 0.2 像素，看不出棱角；底座更大，用 96 段。
+  const SEG = 64, SEG_PEDESTAL = 96, SEG_REFLECT = 32;
+
+  // ---------- 产品：陶瓷瓶身（车削） ----------
+  const R = 0.72;                                   // 瓶身半径
+  const bodyPts = rounded([
+    [0, 0, 0], [R, 0, 0.09],                        // 瓶底外圈倒角
+    [R, 1.42, 0.38],                                // 圆肩（大圆角）
+    [0.3, 1.9, 0.08], [0.255, 1.98, 0.03],          // 肩→颈的内凹过渡
+    [0.255, 2.0, 0],
+    [0.272, 2.02, 0], [0.272, 2.045, 0], [0.255, 2.06, 0],   // 瓶颈螺纹（三圈，开盖后可见）
+    [0.272, 2.08, 0], [0.272, 2.105, 0], [0.255, 2.12, 0],
+    [0.272, 2.14, 0], [0.272, 2.165, 0], [0.255, 2.18, 0],
+    [0.262, 2.22, 0.02], [0.2, 2.235, 0.01], [0.2, 2.15, 0], [0, 2.15, 0], // 瓶口唇边 + 内腔
+  ], 6);
+  function bakeAO(geo) { // 顶点色当"环境光遮蔽"：瓶底贴地处、瓶肩被瓶盖遮住处略暗
+    const p = geo.attributes.position, col = [];
+    for (let i = 0; i < p.count; i++) {
+      const y = p.getY(i), r = Math.hypot(p.getX(i), p.getZ(i));
+      let k = lerp(0.72, 1, smooth(0, 0.16, y)) * lerp(1, 0.55, smooth(1.86, 2.0, y));
+      if (y > 2.13 && r < 0.21) k = 0.12;           // 瓶口内部
+      col.push(k, k, k);
+    }
+    geo.setAttribute('color', new THREE.Float32BufferAttribute(col, 3));
+    return geo;
+  }
+  const bodyGeo = bakeAO(lathe(bodyPts, SEG));
+  const font = (ctx, w, px, ls = 0) => { ctx.font = `${w} ${px}px "Noto Sans CJK SC"`; ctx.textAlign = 'center'; ctx.textBaseline = 'middle'; ctx.letterSpacing = `${ls}px`; };
+  const Y0 = 0.3, Y1 = 1.2;                         // 正面标签占的高度范围（瓶身直筒段是 0.09..1.1，标签上沿略压到圆肩）
+  // 瓶身：缎面陶瓷 + 一层高光清漆（MeshPhysicalMaterial 的 clearcoat，烘焙进 matcap 所以不增加逐帧开销）
+  const bodyMatcap = bake({ color: COLOR.body, roughness: 0.4, metalness: 0, clearcoat: 1, clearcoatRoughness: 0.05 }, 512);
+  const bodyMat = new THREE.MeshMatcapMaterial({ matcap: bodyMatcap, vertexColors: true });
+  const body = new THREE.Mesh(bodyGeo, bodyMat);
+
+  // ---------- 背面丝印：深色字直接印在陶瓷上（转到背面也看得出是印刷，而不是一块空的深色贴纸） ----------
+  // 做成贴着瓶身的一片薄壳（只盖背面这段弧、只在直筒段内），用和瓶身同一张 matcap，白底处和瓶身看不出接缝；
+  // 贴图只在这片壳上采样，瓶身本身不带贴图（软件渲染下整瓶都做贴图采样要贵 20%）
+  const PS0 = 20, PSEG = 24, PY0 = 0.32, PY1 = 1.08; // 从第 PS0 段起、共 PSEG 段（64 段一圈，32 = 正背面）；高度 PY0..PY1
+  function backPrint() {
+    const PW = 1024, PH = Math.round(PW * (PY1 - PY0) / ((PSEG / SEG) * Math.PI * 2 * R)); // 方形像素
+    const [c, g] = canvas2d(PW, PH), X = PW / 2;    // X = 背面正中
+    g.fillStyle = '#fff'; g.fillRect(0, 0, PW, PH);
+    g.fillStyle = g.strokeStyle = COLOR.label;
+    g.lineWidth = 4; g.beginPath(); g.arc(X, PH * 0.1, 24, 0, Math.PI * 2); g.stroke();                    // 徽记
+    g.beginPath(); g.moveTo(X, PH * 0.1 - 13); g.lineTo(X + 9, PH * 0.1); g.lineTo(X, PH * 0.1 + 13); g.lineTo(X - 9, PH * 0.1); g.closePath(); g.fill();
+    font(g, 900, 66, 26); g.fillText(LABEL.back, X + 13, PH * 0.27);                                       // 大字
+    g.fillRect(X - 150, PH * 0.37, 300, 3);
+    font(g, 700, 38, 2); LABEL.fine.slice(0, 3).forEach((s, i) => g.fillText(s, X, PH * (0.47 + i * 0.115))); // 小字（加粗，480p 下才看得出笔画）
+    let x = X - 95; seed = 99;                      // 条形码：随机粗细的竖条
+    while (x < X + 95) { const w = 3 + Math.floor(rand() * 5); if (rand() > 0.35) g.fillRect(x, PH * 0.8, w, PH * 0.13); x += w + 3 + Math.floor(rand() * 4); }
+    const t = new THREE.CanvasTexture(c); t.colorSpace = THREE.SRGBColorSpace; t.anisotropy = 2;
+    return t;
+  }
+  const print = new THREE.Mesh(lathe([[R + 0.0006, PY0], [R + 0.0006, PY1]], PSEG, (PS0 / SEG) * Math.PI * 2, (PSEG / SEG) * Math.PI * 2),
+    new THREE.MeshMatcapMaterial({ map: backPrint(), matcap: bodyMatcap }));
+
+  // ---------- 正面标签：颜色 / 压纹(法线) / 烫金遮罩 三张贴图同一版式 ----------
+  // 标签只包正面 LABEL_WRAP 圈；贴图宽对应这段弧，像素是方的（1 个单位 ≈ 770 像素），480p 下规格小字也能读
+  const LSEG = Math.max(2, Math.round(LABEL_WRAP * SEG / 2) * 2);  // 标签弧的分段数：和瓶身分段对齐，否则会和瓶身穿插
+  const LPHI = (LSEG / SEG) * Math.PI * 2;                         // 实际弧度（正面中心在 phi = 0）
+  function labelMaps() {
+    const LW = 1536, LH = Math.round(LW * (Y1 - Y0) / (LPHI * R)); // 宽对应标签那段弧，高对应标签高度
+    const [cc, g] = canvas2d(LW, LH);               // 颜色
+    const [hc, h] = canvas2d(LW / 2, LH / 2);       // 凸起高度（白 = 凸）；半分辨率就够（压纹斜面只有 1–2 像素宽），准备阶段省一大半时间
+    const [mc, m] = canvas2d(LW, LH);               // B 通道 = 烫金遮罩：1 用金属 matcap，0 用纸 matcap
+    g.fillStyle = COLOR.label; g.fillRect(0, 0, LW, LH);
+    { // 纸张纹理：小块噪点平铺（比逐像素加噪快得多）
+      const [nc, n] = canvas2d(128, 128), img = n.createImageData(128, 128);
+      for (let i = 0; i < img.data.length; i += 4) { const v = 128 + (rand() - 0.5) * 40; img.data[i] = img.data[i + 1] = img.data[i + 2] = v; img.data[i + 3] = 255; }
+      n.putImageData(img, 0, 0);
+      g.globalAlpha = 0.18; g.globalCompositeOperation = 'overlay'; g.fillStyle = g.createPattern(nc, 'repeat'); g.fillRect(0, 0, LW, LH);
+      g.globalAlpha = 1; g.globalCompositeOperation = 'source-over';
+    }
+    h.fillStyle = '#000'; h.fillRect(0, 0, LW / 2, LH / 2); h.scale(0.5, 0.5);
+    m.fillStyle = '#000'; m.fillRect(0, 0, LW, LH);           // 默认全是纸
+    // layer(画法, 类型)：同一图形画进三张图。'foil' 烫金（金属、凸起），'ink' 乳白印刷（微凸）
+    const layer = (paint, kind, color) => {
+      g.fillStyle = g.strokeStyle = color ?? (kind === 'foil' ? COLOR.foil : COLOR.ink); paint(g);
+      h.fillStyle = h.strokeStyle = kind === 'foil' ? '#fff' : '#9a9a9a'; paint(h);
+      if (kind === 'foil') { m.fillStyle = m.strokeStyle = 'rgb(0,0,160)'; paint(m); } // 160 ≈ 纸和金属各一半：转到哪都看得清，又有金属光泽
+    };
+    const FX = LW / 2;                              // 正面中心（开头和结尾都正对镜头，见 draw 里的转台）
+    // 上下烫金边线（粗 + 细双线）。不要加竖线：转到侧面时竖线像接缝
+    layer((c) => { c.fillRect(0, 26, LW, 9); c.fillRect(0, 46, LW, 3); c.fillRect(0, LH - 35, LW, 9); c.fillRect(0, LH - 49, LW, 3); }, 'foil');
+    // 正面：徽记（细圆环 + 菱形）→ 主名 → 英文 → 细线 → 规格
+    const ey = LH * 0.19;
+    layer((c) => { c.lineWidth = 5; c.beginPath(); c.arc(FX, ey, 34, 0, Math.PI * 2); c.stroke(); c.beginPath(); c.moveTo(FX, ey - 20); c.lineTo(FX + 13, ey); c.lineTo(FX, ey + 20); c.lineTo(FX - 13, ey); c.closePath(); c.fill(); }, 'foil');
+    layer((c) => { font(c, 900, 168, 8); const w = c.measureText(LABEL.name).width; if (w > 820) font(c, 900, Math.floor(168 * 820 / w), 8); c.fillText(LABEL.name, FX, LH * 0.41); }, 'ink'); // 名字太长自动缩小
+    layer((c) => { font(c, 700, 54, 30); c.fillText(LABEL.latin, FX + 15, LH * 0.595); }, 'foil');
+    layer((c) => { c.fillRect(FX - 200, LH * 0.665, 400, 4); }, 'foil');
+    layer((c) => { font(c, 700, 54, 3); const w = c.measureText(LABEL.spec).width; if (w > 700) font(c, 700, Math.floor(54 * 700 / w), 3); c.fillText(LABEL.spec, FX, LH * 0.77); }, 'ink', '#dbe2ef');
+    // 压纹高度图先轻微模糊，边缘才有斜面（否则 480p 下看不出凸起）
+    const [bc, b] = canvas2d(LW / 2, LH / 2); b.filter = 'blur(0.8px)'; b.drawImage(hc, 0, 0);
+    const map = new THREE.CanvasTexture(cc); map.colorSpace = THREE.SRGBColorSpace;
+    const rm = new THREE.CanvasTexture(mc), nm = normalFromHeight(bc, 2.0);
+    for (const t of [map, rm, nm]) t.anisotropy = maxAniso;
+    return { map, mask: rm, normalMap: nm };
+  }
+  const labelGeo = lathe([[R + 0.0015, Y0], [R + 0.0045, Y0 + 0.003], [R + 0.0045, Y1 - 0.003], [R + 0.0015, Y1]], LSEG, -LPHI / 2, LPHI); // 带一点厚度的贴纸边
+  const { map: labelMap, mask: labelMask, normalMap: labelNormal } = labelMaps();
+  // 纸用缎面（roughness 0.5）：转到侧面时边缘有一道柔光，深色标签不会和深色背景糊在一起
+  const labelMat = matcapMix({ map: labelMap, normalMap: labelNormal, normalScale: new THREE.Vector2(0.9, 0.9), matcap: bake({ color: WHITE, roughness: 0.5 }) },
+    bake({ color: WHITE, metalness: 1, roughness: 0.36 }), labelMask, 'b', 0.2, 0.8); // 遮罩 B 通道 = 烫金
+  const label = new THREE.Mesh(labelGeo, labelMat);
+
+  // ---------- 瓶盖：圆角车削 + 下部竖向滚花 + 上部抛光带 + 顶面同心拉丝 ----------
+  const capPts = rounded([[0.2, 0.0, 0], [0.33, 0.0, 0], [0.345, 0.012, 0.01], [0.345, 0.53, 0.035], [0.31, 0.56, 0.012], [0, 0.56, 0]], 6);
+  const capGeo = lathe(capPts, SEG);
+  function capMaps() {
+    const CW = 1024, CH = 256, GROOVES = 48;        // GROOVES：滚花条数（太密在 480p 会闪烁）
+    // 用轮廓点的 v 找出侧面范围：滚花占侧面下 62%，其上是抛光带，再往上是顶面
+    const vSide0 = capGeo.userData.vOf(2), vSide1 = capGeo.userData.vOf(capPts.length - 4);
+    const vKnurl = lerp(vSide0, vSide1, 0.62), vTop = capGeo.userData.vOf(capPts.length - 2);
+    const [hc, h] = canvas2d(CW, CH), [mc, m] = canvas2d(CW, CH);
+    const hi = h.createImageData(CW, CH), mi = m.createImageData(CW, CH);
+    const streak = new Float32Array(CH); for (let y = 0; y < CH; y++) streak[y] = rand(); // 沿 v 的拉丝纹（绕一圈的细纹）
+    for (let y = 0; y < CH; y++) {
+      const v = 1 - (y + 0.5) / CH;                 // 画布从上往下 = v 从 1 到 0
+      const band = smooth(vSide0 + 0.004, vSide0 + 0.02, v) * (1 - smooth(vKnurl - 0.02, vKnurl, v));
+      const polished = v > vKnurl + 0.01 && v < vTop;
+      for (let x = 0; x < CW; x++) {
+        const ridge = Math.pow(Math.abs(Math.sin((x / CW) * Math.PI * GROOVES)), 0.6);
+        const i = (y * CW + x) * 4;
+        hi.data[i] = hi.data[i + 1] = hi.data[i + 2] = 255 * (0.5 + 0.5 * band * (ridge - 0.5)); hi.data[i + 3] = 255;
+        const rough = band > 0.5 ? 0.42 + 0.12 * (1 - ridge) : polished ? 0.13 + 0.05 * streak[y] : 0.22 + 0.16 * streak[y];
+        mi.data[i] = 0; mi.data[i + 1] = rough * 255; mi.data[i + 2] = 255; mi.data[i + 3] = 255;
+      }
+    }
+    h.putImageData(hi, 0, 0); m.putImageData(mi, 0, 0);
+    const rm = new THREE.CanvasTexture(mc), nm = normalFromHeight(hc, 3.0);
+    for (const t of [rm, nm]) t.anisotropy = maxAniso;
+    return { mask: rm, normalMap: nm };
+  }
+  const capTex = capMaps();
+  const capMat = matcapMix({ color: COLOR.foil, normalMap: capTex.normalMap, matcap: mcMetalPolished }, mcMetalBrushed, capTex.mask, 'g', 0.16, 0.42); // 遮罩 G 通道 = 粗糙度
+  const cap = new THREE.Mesh(capGeo, capMat);
+  cap.position.y = 1.99;
+
+  const product = new THREE.Group();
+  product.add(body, label, print, cap);
+  // 先画标签/丝印再画瓶身：被挡住的瓶身像素深度测试直接失败，不再算一遍着色（软件渲染下省时间）
+  label.renderOrder = print.renderOrder = 3; body.renderOrder = cap.renderOrder = 3.5;
+
+  // 关键帧动画：瓶盖旋开上抬。用 AnimationMixer 播放，但每帧 mixer.setTime(t) 直接跳到 t（不要 mixer.update(delta)）
+  const capY = cap.position.y, qa = new THREE.Quaternion(), qb = new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(0, 1, 0), Math.PI * 0.9);
+  const capClip = new THREE.AnimationClip('cap-open', DURATION, [
+    new THREE.VectorKeyframeTrack('.position', [0, 3.6, 4.6], [0, capY, 0, 0, capY, 0, 0, capY + 0.42, 0]),
+    new THREE.QuaternionKeyframeTrack('.quaternion', [0, 3.6, 4.6], [...qa.toArray(), ...qa.toArray(), ...qb.toArray()]),
+  ]);
+  const mixer = new THREE.AnimationMixer(cap);
+  const capAction = mixer.clipAction(capClip);
+  capAction.setLoop(THREE.LoopOnce, 1); capAction.clampWhenFinished = true; capAction.play();
+  scene.add(product);
+
+  // ---------- 底座：哑光石材底台 + 拉丝铜圈 + 黑色亮面台面（台面 y = 0，瓶子立在上面） ----------
+  function stoneMap() {                              // 石材：细颗粒 + 横向的淡纹理层 + 少量浅色斑点
+    const [c, g] = canvas2d(1024, 128), img = g.createImageData(1024, 128), d = img.data;
+    const base = new THREE.Color(COLOR.plinth).getRGB({}, THREE.SRGBColorSpace);
+    for (let i = 0; i < d.length; i += 4) {
+      const y = (i >> 2) >> 10, n = 0.92 + rand() * 0.12 + 0.02 * Math.sin(y * 0.11 + Math.sin(y * 0.05) * 2) + (rand() > 0.996 ? 0.3 : 0);
+      d[i] = base.r * 255 * n; d[i + 1] = base.g * 255 * n; d[i + 2] = base.b * 255 * n; d[i + 3] = 255;
+    }
+    g.putImageData(img, 0, 0);
+    const t = new THREE.CanvasTexture(c); t.colorSpace = THREE.SRGBColorSpace; t.anisotropy = 2; return t;
+  }
+  const PR = 1.24, BASE = -0.44;                    // 台面半径、底台底部高度
+  const plinth = new THREE.Mesh(
+    lathe(rounded([[1.3, BASE, 0], [1.34, BASE, 0.03], [1.34, -0.1, 0.03], [PR - 0.04, -0.1, 0]], 6), SEG_PEDESTAL), // 底面看不到，不建
+    new THREE.MeshMatcapMaterial({ map: stoneMap(), matcap: bake({ color: WHITE, roughness: 0.6 }) }),
+  );
+  const ring = new THREE.Mesh(                       // 铜圈：夹在底台和台面之间，和瓶盖同材质
+    lathe(rounded([[PR - 0.02, -0.1, 0], [PR + 0.02, -0.1, 0.012], [PR + 0.02, -0.065, 0.012], [PR - 0.02, -0.065, 0]], 4), SEG_PEDESTAL),
+    new THREE.MeshMatcapMaterial({ color: COLOR.foil, matcap: mcMetalBrushed }),
+  );
+  const slab = new THREE.Mesh(                       // 台面侧边：亮面黑，倒角上会出现灯条高光
+    lathe(rounded([[PR - 0.03, -0.065, 0], [PR, -0.065, 0.015], [PR, 0, 0.02], [PR - 0.03, 0, 0]], 6), SEG_PEDESTAL),
+    new THREE.MeshMatcapMaterial({ matcap: bake({ color: 0x0a0b0e, roughness: 0.1, metalness: 0 }) }),
+  );
+  // 台面顶：不写深度、写模板=1；倒影只画在模板=1 的像素上
+  const top = new THREE.Mesh(new THREE.CircleGeometry(PR - 0.03, SEG_PEDESTAL), new THREE.MeshBasicMaterial({
+    color: 0x050608, depthWrite: false, stencilWrite: true, stencilRef: 1, stencilFunc: THREE.AlwaysStencilFunc, stencilZPass: THREE.ReplaceStencilOp,
+  }));
+  top.rotation.x = -Math.PI / 2; top.renderOrder = 1;
+  const pedestal = new THREE.Group();
+  pedestal.add(plinth, ring, slab, top);
+  scene.add(pedestal);
+
+  // 台面倒影：瓶身 + 标签沿台面镜像，离台面越远越暗（指数衰减），只画在台面上
+  // 倒影用不受光的 MeshBasicMaterial（暗、又在衰减，看不出差别，但便宜很多）；台面以下 0.65 之外的部分本来就看不到，直接裁掉
+  const clipBelow = [new THREE.Plane(new THREE.Vector3(0, 1, 0), 0.65)];
+  renderer.localClippingEnabled = true;
+  function reflectionOf(src, color = src.color) {
+    const m = new THREE.MeshBasicMaterial({ color, map: src.map ?? null, vertexColors: !!src.vertexColors, clippingPlanes: clipBelow,
+      stencilWrite: true, stencilRef: 1, stencilFunc: THREE.EqualStencilFunc });
+    m.onBeforeCompile = (s) => {
+      s.uniforms.uStrength = { value: REFLECT };
+      s.vertexShader = s.vertexShader.replace('#include <common>', '#include <common>\nvarying float vBelow;')
+        .replace('#include <project_vertex>', '#include <project_vertex>\nvBelow = -(modelMatrix * vec4(transformed, 1.0)).y;');
+      s.fragmentShader = s.fragmentShader.replace('#include <common>', '#include <common>\nvarying float vBelow;\nuniform float uStrength;')
+        .replace('#include <dithering_fragment>', '#include <dithering_fragment>\ngl_FragColor.rgb *= uStrength * exp(-2.4 * max(vBelow, 0.0));');
+    };
+    return m;
+  }
+  const mirror = new THREE.Group();
+  mirror.scale.y = -1;                               // 以 y=0（台面）为镜面
+  const rBody = new THREE.Mesh(bakeAO(lathe(bodyPts, SEG_REFLECT)), reflectionOf(bodyMat, new THREE.Color(COLOR.body))); // 倒影是模糊的，用低段数
+  const rLabel = new THREE.Mesh(lathe([[R + 0.003, Y0], [R + 0.003, Y1]], LSEG / 2, -LPHI / 2, LPHI), reflectionOf(labelMat));
+  rBody.renderOrder = rLabel.renderOrder = 2;
+  mirror.add(rBody, rLabel);
+  mirror.visible = REFLECT > 0;
+  scene.add(mirror);
+
+  function radialTexture(size, stops) {              // 径向渐变贴图：stops = [[半径0..1, 'rgba(...)'], ...]
+    const [c, g] = canvas2d(size, size), r = g.createRadialGradient(size / 2, size / 2, 0, size / 2, size / 2, size / 2);
+    for (const [o, s] of stops) r.addColorStop(o, s);
+    g.fillStyle = r; g.fillRect(0, 0, size, size);
+    const t = new THREE.CanvasTexture(c); t.colorSpace = THREE.SRGBColorSpace; return t;
+  }
+  // 台面"光泽 + 接触阴影"合成一层（预乘混合：RGB 往上加亮光，A 往下压暗），盖在倒影上面。
+  // 光泽 = 台面远端（背向镜头那侧）的掠射反光；阴影 = 瓶底一圈由深到浅。一张贴图一次绘制，比真实反射便宜得多
+  function topSheen(N = 256) {
+    const d = new Uint8Array(N * N * 4), cr = R / PR, far = new THREE.Vector2(-Math.sin(CAM_AZ), -Math.cos(CAM_AZ)); // far：远离镜头的方向
+    for (let j = 0; j < N; j++) for (let i = 0; i < N; i++) {
+      const x = (i + 0.5) / N * 2 - 1, z = -((j + 0.5) / N * 2 - 1), r = Math.hypot(x, z), k = (j * N + i) * 4;
+      if (r > 1) continue;
+      const glow = 0.012 + 0.07 * smooth(0.1, 1.0, x * far.x + z * far.y) * smooth(0.35, 0.95, r) + 0.03 * smooth(0.9, 1, r); // 远端掠射反光 + 外缘一圈
+      const shade = r < cr ? 0.9 : 0.55 * Math.exp(-(r - cr) / 0.07) + 0.25 * Math.exp(-(r - cr) / 0.3);         // 接触阴影：贴边很深，往外快速变淡
+      d[k] = d[k + 1] = glow * 0.9 * 255; d[k + 2] = glow * 255; d[k + 3] = Math.min(0.9, shade) * 255;
+    }
+    const t = new THREE.DataTexture(d, N, N); t.magFilter = THREE.LinearFilter; t.needsUpdate = true; return t;
+  }
+  const sheen = new THREE.Mesh(new THREE.CircleGeometry(PR - 0.03, SEG_PEDESTAL), new THREE.MeshBasicMaterial({
+    map: topSheen(), depthWrite: false, blending: THREE.CustomBlending,
+    blendSrc: THREE.OneFactor, blendDst: THREE.OneMinusSrcAlphaFactor, blendSrcAlpha: THREE.OneFactor, blendDstAlpha: THREE.OneMinusSrcAlphaFactor,
+  }));
+  sheen.rotation.x = -Math.PI / 2; sheen.renderOrder = 4;
+  scene.add(sheen);
+
+  // 地面：只是底台投下的软阴影 + 一圈淡淡的反光，边缘渐隐进 CSS 背景（面积尽量小：软件渲染下大面积半透明很贵；
+  // 用圆环而不是圆盘，被底台盖住的中间部分不画）。
+  // 放在不透明队列最前面画（renderOrder -1 + 自定义混合），这样被台面挡住的部分不会盖到台面上
+  const FR = 2.4, pr = 1.34 / FR;                 // FR：地面阴影外半径（越大越贵：半透明大面积填充）
+  const floor = new THREE.Mesh(new THREE.RingGeometry(1.25, FR, SEG_PEDESTAL), new THREE.MeshBasicMaterial({
+    map: radialTexture(1024, [[0, 'rgba(0,0,0,0.92)'], [pr, 'rgba(0,0,0,0.92)'], [pr * 1.05, 'rgba(3,4,7,0.72)'], [pr * 1.3, 'rgba(8,10,15,0.42)'], [pr * 1.65, 'rgba(24,29,40,0.16)'], [1, 'rgba(24,29,40,0)']]),
+    depthWrite: false, blending: THREE.CustomBlending,
+    blendSrc: THREE.SrcAlphaFactor, blendDst: THREE.OneMinusSrcAlphaFactor, blendSrcAlpha: THREE.OneFactor, blendDstAlpha: THREE.OneMinusSrcAlphaFactor,
+  }));
+  floor.rotation.x = -Math.PI / 2; floor.position.y = BASE; floor.renderOrder = -1;
+  scene.add(floor);
+
+  // ---------- 相机 ----------
+  const camera = new THREE.PerspectiveCamera(30, W / H, 0.5, 60);
+  const target = new THREE.Vector3(0, 1.2, 0);
+  const baseDist = fitDistance(W > H ? 2.05 : 1.7, camera); // 半径含瓶盖上抬后的高度和底座（横版画面矮，半径小一点产品才不显小）
+  // 构图：竖版主体略上移（底部 20% 留给字幕）；横版主体右移，左边放文字
+  if (W > H) camera.setViewOffset(W, H, -W * 0.2, 0, W, H);
+  else camera.setViewOffset(W, H, 0, H * 0.015, W, H);
+
+  const hudTitle = document.getElementById('title'), hudSub = document.getElementById('sub');
+
+  draw = (t) => {
+    // 转台：转 TURNS 圈 + 多转 LEAD，结尾标签正面正对镜头（rotation.y = CAM_AZ 时正面朝镜头）。
+    // 速度两头慢、中间快（spin 是"线性 - 正弦"曲线）：正面停留时间长，背面一带而过；倒影跟着同步
+    const LEAD = 0.35, x = t / DURATION, spin = x - 0.6 * Math.sin(2 * Math.PI * x) / (2 * Math.PI);
+    product.rotation.y = CAM_AZ - LEAD + (TURNS * Math.PI * 2 + LEAD) * spin;
+    mirror.rotation.y = product.rotation.y;
+    mixer.setTime(t);
+    // 相机：从稍远稍高缓慢推近、降低机位
+    const p = easeInOut(seg(t, 0, DURATION));
+    const dist = baseDist * (W > H ? lerp(1.1, 1.03, p) : lerp(1.2, 1.04, p)); // 横版开头就不要太远，免得产品小、四周空
+    const elev = lerp(0.3, 0.13, p);
+    camera.position.set(Math.sin(CAM_AZ) * dist * Math.cos(elev), target.y + dist * Math.sin(elev), Math.cos(CAM_AZ) * dist * Math.cos(elev));
+    camera.lookAt(target);
+    // 叠层文字：淡入上移
+    const a1 = easeOut(seg(t, 0.3, 1.1)), a2 = easeOut(seg(t, 0.8, 1.6));
+    hudTitle.style.opacity = a1; hudTitle.style.transform = `translateY(${(1 - a1) * 3}vmin)`;
+    hudSub.style.opacity = a2; hudSub.style.transform = `translateY(${(1 - a2) * 3}vmin)`;
+    renderer.render(scene, camera);
+  };
+  await renderer.compileAsync(scene, camera); // 编译全部可见物体的着色器（此时所有物体都还可见）
+  draw(0);                                    // 预热一帧：上传贴图
+})();
+window.renderFrame = async (t) => { await window.sceneReady; draw(t); };
+</script>
+</body>
+</html>

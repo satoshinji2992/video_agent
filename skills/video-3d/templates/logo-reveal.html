@@ -1,0 +1,518 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<!-- 标志揭示（广播台标风格）：倒角挤出字母 + 拉丝金属字面 / 抛光倒角 + 程序化影棚环境反射；
+     粒子从四周汇聚成字，同时一条发光的"烧入"边从左到右把字显出来；随后一道扫光掠过倒角，
+     镜面地台上有倒影和接触阴影，前后景有虚化光斑（景深感），低分辨率辉光只让真正的高光发亮。
+     "LOGO" 是占位，换成用户给的品牌字母（随附字体只有拉丁字母和数字）；中文标语用 HTML 叠层。 -->
+<style>
+  html, body { margin: 0; width: 100%; height: 100%; overflow: hidden; background: #050507; }
+  canvas { display: block; position: fixed; inset: 0; z-index: 2; }
+  #bg { z-index: 0; width: 100%; height: 100%; }
+  #glow { position: fixed; z-index: 1; border-radius: 50%; pointer-events: none; }
+  #hud { position: fixed; inset: 0; z-index: 4; font-family: "Noto Sans CJK SC", sans-serif; color: #fff; pointer-events: none; }
+  #tag { position: absolute; left: 0; right: 0; top: 70%; text-align: center; font-size: 4.2vmin; font-weight: 500; letter-spacing: 0.5em; color: #eadbb8; text-shadow: 0 0 1.2vmin rgba(255, 200, 120, 0.35); }
+  @media (min-aspect-ratio: 1/1) { #tag { top: 79%; } }
+</style>
+<script type="importmap">
+{ "imports": { "three": "/vendor/three/build/three.module.js", "three/addons/": "/vendor/three/examples/jsm/" } }
+</script>
+</head>
+<body>
+<!-- 背景和背光用 2D 画布/CSS 画在 WebGL 画布下面（WebGL 画布透明）：比在 WebGL 里铺满屏贴图省一大截软件渲染时间 -->
+<canvas id="bg"></canvas>
+<div id="glow"></div>
+<div id="hud"><div id="tag">品质 · 由此开始</div></div>
+<script type="module">
+import * as THREE from 'three';
+import { FontLoader } from 'three/addons/loaders/FontLoader.js';
+import { TextGeometry } from 'three/addons/geometries/TextGeometry.js';
+import { toCreasedNormals, mergeVertices } from 'three/addons/utils/BufferGeometryUtils.js';
+// 字体 JSON 作为模块静态导入：页面 load 事件前就绪，可同步建模（不要用 FontLoader.load 异步加载）
+import fontJson from '/vendor/three/examples/fonts/helvetiker_bold.typeface.json' with { type: 'json' };
+
+// ================= 可调参数 =================
+const DURATION = 5;                 // 镜头时长（秒）
+const TEXT = 'LOGO';                // 品牌字母（拉丁字母/数字；4–8 个字符效果最好）
+const METAL = 0xe9c27c;             // 金属颜色：金 0xe9c27c，香槟 0xe8d2b0，银/铬 0xd8dde4，玫瑰金 0xe8b4a0
+const FACE_ROUGHNESS = 0.32;        // 字面拉丝的粗糙度（0.2 更亮更镜面，0.45 更哑）
+const EDGE_ROUGHNESS = 0.08;        // 倒角抛光的粗糙度（越小，倒角上的高光线越锐利）
+const GLOW = new THREE.Color(1.0, 0.62, 0.28); // 烧入边、粒子、背光的暖色（换成品牌色也行）
+const BG_CENTER = '#1b1813', BG_EDGE = '#040406'; // 背景：中间偏暖的深灰 → 四周近黑
+const BLOOM = 0.4;                  // 辉光强度（只作用于亮度超过阈值的高光；0.25 更克制，0.7 更梦幻）
+// 时间轴（秒）：粒子在 REVEAL 区间内按从左到右的顺序落到字面上，烧入边同步扫过
+const REVEAL_START = 0.8, REVEAL_END = 2.3;
+const SHINE_START = 2.5, SHINE_END = 3.5;   // 扫光掠过字面和倒角
+const TAG_START = 2.9;                       // 标语淡入
+// ============================================
+
+// ---------- 准备阶段（异步）：先等字体，再同步建场景，最后预热一帧（编译着色器） ----------
+// 系统在逐帧截图前会 await window.sceneReady（最多 30 秒）；renderFrame 自己也会等它。
+let draw; // 逐帧绘制函数 draw(t)，准备完成后赋值
+window.sceneReady = (async () => {
+  // 系统字体（Noto Sans CJK SC）不走网络，但仍先 load，确保标语字体已就绪
+  await Promise.all(['500', '700'].map((w) => document.fonts.load(`${w} 64px "Noto Sans CJK SC"`, '中文')));
+
+  const W = innerWidth, H = innerHeight, DPR = window.devicePixelRatio || 1;
+  const clamp = (x, a = 0, b = 1) => Math.min(b, Math.max(a, x));
+  const seg = (t, a, b) => clamp((t - a) / (b - a));
+  const easeInOut = (x) => (x < 0.5 ? 4 * x * x * x : 1 - Math.pow(-2 * x + 2, 3) / 2);
+  const easeOut = (x) => 1 - Math.pow(1 - x, 3);
+  const lerp = (a, b, x) => a + (b - a) * x;
+  function fitDistance(radius, cam) {
+    const v = THREE.MathUtils.degToRad(cam.fov) / 2, h = Math.atan(Math.tan(v) * cam.aspect);
+    return radius / Math.sin(Math.min(v, h));
+  }
+  function mulberry32(a) { return () => { a |= 0; a = (a + 0x6d2b79f5) | 0; let t = Math.imul(a ^ (a >>> 15), 1 | a); t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t; return ((t ^ (t >>> 14)) >>> 0) / 4294967296; }; }
+  const rand = mulberry32(11);
+
+  // 渲染器：像素比必须跟随 devicePixelRatio（系统用 2 倍超采样渲染 3D 镜头再缩小，这就是抗锯齿）
+  const renderer = new THREE.WebGLRenderer({ antialias: false, alpha: true, preserveDrawingBuffer: true });
+  renderer.setClearColor(0x000000, 0); // 透明清屏，露出下面的背景画布
+  renderer.setPixelRatio(DPR);
+  renderer.setSize(W, H);
+  renderer.toneMapping = THREE.ACESFilmicToneMapping;
+  renderer.toneMappingExposure = 1.0;
+  document.body.prepend(renderer.domElement);
+  const scene = new THREE.Scene();
+  window.__three = { renderer, scene };                          // 让系统统计三角形数和贴图数
+
+  // ---------- 背景：径向渐变 + 抖动噪点（防止暗部色带），一次性画到 #bg 画布 ----------
+  {
+    const c = document.getElementById('bg');
+    c.width = Math.round(W * DPR / 2); c.height = Math.round(H * DPR / 2);
+    const g = c.getContext('2d');
+    const r = Math.max(c.width, c.height) * 0.75;
+    const grad = g.createRadialGradient(c.width * 0.5, c.height * 0.44, 0, c.width * 0.5, c.height * 0.44, r);
+    grad.addColorStop(0, BG_CENTER); grad.addColorStop(1, BG_EDGE);
+    g.fillStyle = grad; g.fillRect(0, 0, c.width, c.height);
+    // 暗角（画进背景，不再单独叠一层全屏 div）
+    g.save(); g.translate(c.width / 2, c.height * 0.45); g.scale(c.width * 0.85, c.height * 0.7);
+    const vg = g.createRadialGradient(0, 0, 0, 0, 0, 1);
+    vg.addColorStop(0.45, 'rgba(0,0,0,0)'); vg.addColorStop(1, 'rgba(0,0,0,0.55)');
+    g.fillStyle = vg; g.fillRect(-2, -2, 4, 4); g.restore();
+    // 噪点：只生成一块 128×128 的小图，平铺"加亮"上去（整屏 getImageData 回读在软件渲染下要半秒多）
+    const tile = document.createElement('canvas'); tile.width = tile.height = 128;
+    const tg = tile.getContext('2d'), img = tg.createImageData(128, 128), d = img.data, nr = mulberry32(7);
+    for (let i = 0; i < d.length; i += 4) { d[i] = d[i + 1] = d[i + 2] = Math.floor(nr() * 4); d[i + 3] = 255; } // 每像素加 0–3 级亮度
+    tg.putImageData(img, 0, 0);
+    g.globalCompositeOperation = 'lighter'; g.fillStyle = g.createPattern(tile, 'repeat'); g.fillRect(0, 0, c.width, c.height);
+    g.globalCompositeOperation = 'source-over';
+  }
+
+  // ---------- 程序化影棚环境：暗房间 + 几块发光灯箱（顶光、左右灯条、背后轮廓灯），PMREM 预滤波 ----------
+  // 金属只靠反射环境发亮，灯箱的形状 = 倒角上高光线的形状。想要更冷/更暖的反光，改灯箱颜色。
+  {
+    const env = new THREE.Scene();
+    env.background = new THREE.Color(0.012, 0.012, 0.014);
+    const box = (w, h, x, y, z, color, rx = 0, ry = 0) => {
+      const m = new THREE.Mesh(new THREE.PlaneGeometry(w, h), new THREE.MeshBasicMaterial({ color, side: THREE.DoubleSide }));
+      m.position.set(x, y, z); m.rotation.set(rx, ry, 0); m.lookAt(0, 0, 0); env.add(m);
+    };
+    box(6, 2.2, 0, 6, 2, new THREE.Color(5, 4.8, 4.5));        // 顶部大柔光箱（主光）
+    box(0.7, 7, -6, 0.5, 2.5, new THREE.Color(3.8, 3.65, 3.4)); // 左侧竖灯条（太亮会把 O、G 的内壁打成一块死白）
+    box(0.7, 7, 6.5, 0.5, 1, new THREE.Color(3.2, 3.35, 3.8));  // 右侧竖灯条（略冷，增加色彩层次）
+    box(20, 0.6, 0, -1.2, 7, new THREE.Color(1.4, 1.33, 1.22)); // 正前下方横灯条：字面主要反射它；要够宽，环境转动后两端的字（比如 L）也照得到
+    box(7, 0.5, 0, -1.2, 6.9, new THREE.Color(1.3, 1.22, 1.1)); // 横灯条中段加亮：字面中间亮、两端稍暗，有层次但不发黑
+    box(16, 5, 0, 3.4, 7, new THREE.Color(0.95, 0.88, 0.78)); // 正前上方大面积柔光：字面朝镜头，靠它显出金色而不是发黑
+    box(26, 3, 0, 0.6, 8, new THREE.Color(0.3, 0.27, 0.24));  // 正前方水平的宽幅弱补光：字面反射的正是这一圈，缺了它两端的字（比如 L）会发黑
+    box(2.2, 6, -3, 1, -6, new THREE.Color(6, 5, 4));          // 背后轮廓灯
+    box(2.2, 6, 3.5, 1, -6, new THREE.Color(5, 5, 5.5));
+    const pmrem = new THREE.PMREMGenerator(renderer);
+    scene.environment = pmrem.fromScene(env, 0.02).texture;
+    scene.environmentIntensity = 1.0;
+    pmrem.dispose();
+  }
+
+  // ---------- 程序化拉丝贴图：粗糙度（低频污迹 + 横向拉丝）和法线（拉丝纹的细微起伏） ----------
+  function brushedMaps() {
+    const S = 256, rough = new Uint8Array(S * S * 4), nrm = new Uint8Array(S * S * 4), nr = mulberry32(3);
+    const rowH = new Float32Array(S); // 每行一个随机高度 = 横向拉丝
+    for (let y = 0; y < S; y++) rowH[y] = nr();
+    const blob = Array.from({ length: 6 }, () => [nr() * S, nr() * S, 20 + nr() * 50, nr() - 0.5]);
+    for (let y = 0; y < S; y++) for (let x = 0; x < S; x++) {
+      const i = (y * S + x) * 4;
+      let smudge = 0;
+      for (const [bx, by, br, a] of blob) { const dx = Math.min(Math.abs(x - bx), S - Math.abs(x - bx)), dy = Math.min(Math.abs(y - by), S - Math.abs(y - by)); smudge += a * Math.exp(-(dx * dx + dy * dy) / (br * br)); }
+      const line = rowH[y] * 0.7 + rowH[(y + 1) % S] * 0.3 + Math.sin(x * 0.05 + rowH[y] * 9) * 0.1;
+      const r = clamp(0.5 + smudge * 0.35 + (line - 0.5) * 0.18);
+      rough[i] = rough[i + 2] = 0; rough[i + 1] = r * 255; rough[i + 3] = 255; // 粗糙度读 G 通道
+      const dh = rowH[(y + 1) % S] - rowH[(y + S - 1) % S]; // 行与行之间的高度差 → 法线沿 y 倾斜
+      nrm[i] = 128; nrm[i + 1] = 128 + dh * 24; nrm[i + 2] = 255; nrm[i + 3] = 255;
+    }
+    const mk = (data) => { const t = new THREE.DataTexture(data, S, S); t.wrapS = t.wrapT = THREE.RepeatWrapping; t.repeat.set(2.5, 2.5); t.magFilter = THREE.LinearFilter; t.minFilter = THREE.LinearMipmapLinearFilter; t.generateMipmaps = true; t.anisotropy = 4; t.needsUpdate = true; return t; };
+    return { rough: mk(rough), normal: mk(nrm) };
+  }
+  const maps = brushedMaps();
+
+  // ---------- 文字几何：大尺寸建模再缩小（折痕法线的顶点合并精度是 0.01），倒角平滑、字面与侧壁之间保持硬边 ----------
+  const font = new FontLoader().parse(fontJson);
+  let geo = new TextGeometry(TEXT, { font, size: 10, depth: 2.6, curveSegments: 10, bevelEnabled: true, bevelThickness: 0.7, bevelSize: 0.45, bevelSegments: 5 });
+  toCreasedNormals(geo, THREE.MathUtils.degToRad(35));
+  { // 字面（材质 0 的各组）保持绝对平整的法线：否则字面会和倒角第一圈一起被平滑，大面上出现皱褶状的反光
+    const n = geo.attributes.normal;
+    for (const g of geo.groups) if (g.materialIndex === 0) for (let i = g.start; i < g.start + g.count; i++) n.setXYZ(i, 0, 0, Math.sign(n.getZ(i)) || 1);
+  }
+  geo.scale(0.1, 0.1, 0.1);
+  { const uv = geo.attributes.uv; for (let i = 0; i < uv.count; i++) uv.setXY(i, uv.getX(i) * 0.1, uv.getY(i) * 0.1); } // UV 也缩回 1 单位 = 字高
+  geo = mergeVertices(geo); // 共享顶点（位置/法线/UV 都相同的才合并），少做重复的顶点着色
+  geo.computeBoundingBox();
+  const bb = geo.boundingBox, tw = bb.max.x - bb.min.x, th = bb.max.y - bb.min.y;
+  geo.translate(-(bb.min.x + bb.max.x) / 2, -bb.min.y, -(bb.min.z + bb.max.z) / 2); // 底边落在 y=0（地台面）
+  geo.computeBoundingBox();
+  const depthHalf = geo.boundingBox.max.z;
+
+  // ---------- 材质：字面 = 拉丝金属（粗糙度/法线贴图）；倒角/侧壁 = 抛光金属，两者的反光差异就是精致感的来源 ----------
+  // （试过 MeshPhysicalMaterial 清漆层：480p 下看不出区别，却更慢、编译更久，所以用 MeshStandardMaterial）
+  // 烧入显现、发光边、扫光都写在着色器里（onBeforeCompile），倒影共用同一组 uniform。
+  const U = {
+    uReveal: { value: -10 },                    // 显现边的 x（对象空间），x 大于它的部分还没显现
+    uEdge: { value: new THREE.Color(0, 0, 0) },  // 显现边发光颜色 × 强度
+    uShine: { value: -10 },                     // 扫光带的位置
+    uShineAmt: { value: 0 },
+    uFloorY: { value: 0 },
+  };
+  function patch(mat, refl) {
+    mat.customProgramCacheKey = () => (refl ? 'logo-refl' : 'logo');
+    mat.onBeforeCompile = (s) => {
+      Object.assign(s.uniforms, U);
+      s.vertexShader = s.vertexShader
+        .replace('#include <common>', '#include <common>\nvarying vec3 vObj; varying float vWorldY;')
+        .replace('#include <begin_vertex>', '#include <begin_vertex>\nvObj = position; vWorldY = (modelMatrix * vec4(position, 1.0)).y;');
+      s.fragmentShader = s.fragmentShader
+        .replace('#include <common>', `#include <common>
+          varying vec3 vObj; varying float vWorldY;
+          uniform float uReveal, uShine, uShineAmt, uFloorY; uniform vec3 uEdge;`)
+        .replace('#include <clipping_planes_fragment>', `#include <clipping_planes_fragment>
+          // 烧入边：带一点起伏的竖线，左边已显现，右边丢弃
+          float edgeX = uReveal + 0.05 * sin(vObj.y * 11.0 + vObj.z * 6.0) + 0.03 * sin(vObj.y * 37.0 + 1.7) + 0.015 * sin(vObj.y * 83.0 + vObj.z * 21.0);
+          float dEdge = edgeX - vObj.x;
+          if (dEdge < 0.0) discard;` + (refl ? '\n          if (uFloorY - vWorldY > 0.65) discard; // 倒影只画靠近地面的一段，下面的反正已经淡没' : ''))
+        .replace('#include <emissivemap_fragment>', `#include <emissivemap_fragment>
+          totalEmissiveRadiance += uEdge * (exp(-dEdge * 28.0) + 0.35 * exp(-dEdge * 6.0));
+          float sb = (vObj.x * 0.8 + vObj.y * 0.6) - uShine;
+          totalEmissiveRadiance += vec3(1.0, 0.86, 0.66) * uShineAmt * (exp(-sb * sb * 220.0) + 0.25 * exp(-sb * sb * 30.0));`);
+      if (refl) {
+        // 倒影（MeshBasicMaterial）：只有环境反射 × 金属色，再加上显现边的光；离地越远越淡（加法混合，不用排序）
+        s.fragmentShader = s.fragmentShader.replace('#include <envmap_fragment>', `#include <envmap_fragment>
+          outgoingLight += uEdge * exp(-dEdge * 20.0);`).replace('#include <dithering_fragment>', `#include <dithering_fragment>
+          gl_FragColor.rgb *= 0.22 * exp(-(uFloorY - vWorldY) * 5.5); gl_FragColor.a = 0.0; // 纯加法，不改画布透明度`);
+      }
+    };
+    return mat;
+  }
+  const faceMat = patch(new THREE.MeshStandardMaterial({
+    color: METAL, metalness: 1, roughness: FACE_ROUGHNESS, roughnessMap: maps.rough, normalMap: maps.normal, normalScale: new THREE.Vector2(0.12, 0.12),
+  }), false);
+  const sideMat = patch(new THREE.MeshStandardMaterial({ color: METAL, metalness: 1, roughness: EDGE_ROUGHNESS }), false);
+  const logo = new THREE.Mesh(geo, [faceMat, sideMat]); // TextGeometry 每个字母两组：材质 0 = 正反字面，材质 1 = 侧壁和倒角
+  scene.add(logo);
+  logo.layers.enable(1); // 图层 1 = 参与辉光的物体（只有字：烧入边、扫光、倒角高光）
+
+  // 倒影：同一几何沿地面镜像；倒影很淡，用便宜的 MeshBasicMaterial + 环境贴图（一次查表），而不是完整 PBR
+  const reflMat = patch(new THREE.MeshBasicMaterial({ color: METAL, envMap: scene.environment, combine: THREE.MultiplyOperation, reflectivity: 1, transparent: true, blending: THREE.AdditiveBlending, premultipliedAlpha: true, depthWrite: false }), true);
+  const refl = new THREE.Mesh(geo, reflMat);
+  refl.scale.y = -1; refl.renderOrder = 2;
+  scene.add(refl);
+
+  // ---------- 地台：近处暗色亮面、远处融进背景；接触阴影和显现边的地面反光都在这里算 ----------
+  const floorMat = new THREE.ShaderMaterial({
+    transparent: true, depthWrite: false,
+    uniforms: { uHalfW: { value: tw / 2 }, uDepth: { value: depthHalf }, uReveal: U.uReveal, uEdge: U.uEdge, uPool: { value: 0 }, uGlow: { value: GLOW } },
+    vertexShader: `varying vec2 vXZ; void main() { vec4 w = modelMatrix * vec4(position, 1.0); vXZ = w.xz; gl_Position = projectionMatrix * viewMatrix * w; }`,
+    fragmentShader: `
+      varying vec2 vXZ; uniform float uHalfW, uDepth, uReveal, uPool; uniform vec3 uEdge, uGlow;
+      void main() {
+        vec2 q = vXZ / vec2(uHalfW * 1.6, 2.2);
+        float r2 = dot(q, q);
+        float a = 0.92 * exp(-r2 * 1.4);                    // 近处不透明，远处淡出到背景
+        vec3 col = vec3(0.010, 0.009, 0.008) + uGlow * uPool * 0.05 * exp(-r2 * 3.0); // 暗地面 + 暖色光池
+        // 接触阴影：字母底部一条柔和暗带，只在已显现的部分
+        float inX = smoothstep(uHalfW + 0.08, uHalfW - 0.12, abs(vXZ.x)) * smoothstep(uReveal + 0.1, uReveal - 0.1, vXZ.x);
+        float dz = max(abs(vXZ.y) - uDepth, 0.0);
+        float occ = inX * (0.75 * exp(-dz * 14.0) + 0.25 * exp(-dz * 3.0));
+        col *= 1.0 - occ * 0.9; a = max(a, occ * 0.95);
+        // 显现边在地面上的反光
+        float e = exp(-pow(vXZ.x - uReveal, 2.0) * 10.0 - vXZ.y * vXZ.y * 4.0);
+        col += uEdge * 0.06 * e;
+        gl_FragColor = vec4(col, a);
+        #include <colorspace_fragment>
+      }`,
+  });
+  const floor = new THREE.Mesh(new THREE.PlaneGeometry(tw * 2.6, 7), floorMat);
+  floor.rotation.x = -Math.PI / 2; floor.position.y = -0.001; floor.renderOrder = 1;
+  scene.add(floor);
+
+  // ---------- 背光：字后方一片柔和的暖色体积光晕（#glow 的 CSS 径向渐变，按相机投影摆位） ----------
+  const glowEl = document.getElementById('glow'), GLOW_AT = new THREE.Vector3(0, th * 0.55, -1.2), GLOW_R = new THREE.Vector3(tw * 1.0, th * 0.55, -1.2);
+  const cssRGB = (c, k) => `rgba(${Math.round(c.r * 255)},${Math.round(c.g * 255)},${Math.round(c.b * 255)},${k})`;
+  { const c = GLOW.clone().convertLinearToSRGB(); glowEl.style.background = `radial-gradient(closest-side, ${cssRGB(c, 1)} 0%, ${cssRGB(c, 0.35)} 35%, ${cssRGB(c, 0)} 100%)`; }
+  const _v = new THREE.Vector3();
+  function placeGlow(opacity) { // 把字后方 GLOW_AT 处的光晕投影到屏幕，跟着相机走
+    const c = _v.copy(GLOW_AT).project(camera), x = (c.x + 1) / 2 * W, y = (1 - c.y) / 2 * H;
+    const r = Math.abs((_v.copy(GLOW_R).project(camera).x + 1) / 2 * W - x);
+    Object.assign(glowEl.style, { left: `${x - r}px`, top: `${y - r * 1.1}px`, width: `${2 * r}px`, height: `${2.2 * r}px`, opacity: String(opacity) });
+  }
+
+  // ---------- 汇聚粒子：均匀撒在正面字面上（按面积采样），按 x 顺序在烧入边经过前落位 ----------
+  const revealX = (k) => lerp(-tw / 2 - 0.12, tw / 2 + 0.12, easeInOut(k)); // 烧入边位置随进度 k 的变化
+  function arriveTime(x) { // 烧入边到达 x 的时刻（二分反解缓动）
+    let lo = 0, hi = 1;
+    for (let i = 0; i < 24; i++) { const m = (lo + hi) / 2; if (revealX(m) < x) lo = m; else hi = m; }
+    return lerp(REVEAL_START, REVEAL_END, lo);
+  }
+  const PCOUNT = 2200;
+  let partMat, particles, dustMat, dust;
+  {
+    const pos = geo.attributes.position, nrm = geo.attributes.normal, idx = geo.index;
+    const tris = [], cdf = [];
+    let acc = 0;
+    for (const g of geo.groups) if (g.materialIndex === 0) for (let i = g.start; i < g.start + g.count; i += 3) { // 每个字母各有一组字面
+      const ia = idx.getX(i), ib = idx.getX(i + 1), ic = idx.getX(i + 2);
+      if (nrm.getZ(ia) < 0.5) continue; // 只要正面
+      const a = new THREE.Vector3().fromBufferAttribute(pos, ia), b = new THREE.Vector3().fromBufferAttribute(pos, ib), c = new THREE.Vector3().fromBufferAttribute(pos, ic);
+      acc += new THREE.Triangle(a, b, c).getArea(); tris.push([a, b, c]); cdf.push(acc);
+    }
+    const aFrom = new Float32Array(PCOUNT * 3), aTo = new Float32Array(PCOUNT * 3), aT = new Float32Array(PCOUNT * 3);
+    const p = new THREE.Vector3();
+    for (let i = 0; i < PCOUNT; i++) {
+      const r = rand() * acc; let lo = 0, hi = cdf.length - 1;
+      while (lo < hi) { const m = (lo + hi) >> 1; if (cdf[m] < r) lo = m + 1; else hi = m; }
+      const [a, b, c] = tris[lo]; let u = rand(), v = rand(); if (u + v > 1) { u = 1 - u; v = 1 - v; }
+      p.copy(a).addScaledVector(b.clone().sub(a), u).addScaledVector(c.clone().sub(a), v);
+      aTo.set([p.x, p.y, p.z + 0.01], i * 3);
+      // 起点：围绕字的一圈宽大的螺旋带（偏左后方），飞行 1.2–2.2 秒，第 0 帧就有粒子在空中
+      const ang = rand() * Math.PI * 2, rr = 2.2 + rand() * 3.5;
+      aFrom.set([Math.cos(ang) * rr * 1.3 - 0.8, th * 0.5 + (rand() - 0.5) * 2.4 + Math.sin(ang) * 0.6, Math.sin(ang) * rr - 0.5], i * 3);
+      const ta = arriveTime(p.x) - 0.04 - rand() * 0.12;
+      aT.set([ta - 1.2 - rand() * 1.0, ta, rand()], i * 3);
+    }
+    const pg = new THREE.BufferGeometry();
+    pg.setAttribute('position', new THREE.BufferAttribute(aTo.slice(), 3)); // 只用于包围盒
+    pg.setAttribute('aFrom', new THREE.BufferAttribute(aFrom, 3));
+    pg.setAttribute('aTo', new THREE.BufferAttribute(aTo, 3));
+    pg.setAttribute('aT', new THREE.BufferAttribute(aT, 3));
+    partMat = new THREE.ShaderMaterial({
+      transparent: true, depthWrite: false, blending: THREE.AdditiveBlending, premultipliedAlpha: true, // 加法混合且 alpha 输出 0：叠加发光，不改画布透明度
+      uniforms: { uTime: { value: 0 }, uPx: { value: 1 }, uColor: { value: GLOW.clone().multiplyScalar(1.6) } },
+      vertexShader: `
+        const float HALO = 2.4;
+        attribute vec3 aFrom, aTo, aT; uniform float uTime, uPx; varying float vA;
+        void main() {
+          float k = clamp((uTime - aT.x) / (aT.y - aT.x), 0.0, 1.0);
+          float e = k * k * (3.0 - 2.0 * k);
+          float s = aT.z * 6.2832;
+          vec3 swirl = (1.0 - e) * vec3(sin(s + k * 5.0), cos(s * 1.3 + k * 4.0) * 0.6, cos(s + k * 5.0)) * 0.9;
+          vec3 p = mix(aFrom, aTo, e) + swirl;
+          vA = smoothstep(0.0, 0.25, k) * (1.0 - smoothstep(aT.y, aT.y + 0.22, uTime)) * (0.55 + 0.45 * k);
+          vec4 mv = modelViewMatrix * vec4(p, 1.0);
+          gl_PointSize = max(0.022 * HALO * uPx / -mv.z, 2.5); // 精灵放大 HALO 倍：中间是亮核，外圈是自带的柔光
+          gl_Position = projectionMatrix * mv;
+        }`,
+      fragmentShader: `
+        uniform vec3 uColor; varying float vA;
+        void main() { // 亮核（和原来的粒子一样大）+ 很淡的外圈光晕；外圈用 (1-r²)² 收到 0，精灵边上不出方块
+          vec2 d = (gl_PointCoord - 0.5) * 2.4; float r2 = dot(d, d);
+          float a = (exp(-r2 * 18.0) + 0.06 * max(1.0 - r2 / 1.44, 0.0) * max(1.0 - r2 / 1.44, 0.0)) * vA;
+          if (a < 0.004) discard; gl_FragColor = vec4(uColor * a, 0.0);
+        }`,
+    });
+    particles = new THREE.Points(pg, partMat);
+    particles.frustumCulled = false; particles.renderOrder = 3;
+    // 粒子不进辉光图层：两千多颗粒子挤在字周围，进辉光会糊成一整片发白的雾，所以光晕直接画在粒子精灵里
+    scene.add(particles);
+  }
+
+  // ---------- 虚化光斑（景深感）：前景/背景的浮尘，离对焦距离越远越大越淡 ----------
+  const DCOUNT = 90;
+  {
+    const a = new Float32Array(DCOUNT * 3), sd = new Float32Array(DCOUNT);
+    for (let i = 0; i < DCOUNT; i++) {
+      const near = i < 8; // 少量离镜头很近的大光斑
+      const z = near ? 2.5 + rand() * 3 : -4 + rand() * 5.5;
+      a.set([(rand() - 0.5) * (near ? 6 : 12), -0.2 + rand() * (near ? 2.5 : 4.5), z], i * 3);
+      sd[i] = rand();
+    }
+    const dg = new THREE.BufferGeometry();
+    dg.setAttribute('position', new THREE.BufferAttribute(a, 3));
+    dg.setAttribute('aSeed', new THREE.BufferAttribute(sd, 1));
+    dustMat = new THREE.ShaderMaterial({
+      transparent: true, depthWrite: false, blending: THREE.AdditiveBlending, premultipliedAlpha: true, // 加法混合且 alpha 输出 0：叠加发光，不改画布透明度
+      uniforms: { uTime: { value: 0 }, uPx: { value: 1 }, uFocus: { value: 6 }, uAmt: { value: 1 }, uColor: { value: GLOW.clone().lerp(new THREE.Color(1, 1, 1), 0.4) } },
+      vertexShader: `
+        attribute float aSeed; uniform float uTime, uPx, uFocus, uAmt; varying float vA; varying float vSoft;
+        void main() {
+          float s = aSeed * 6.2832;
+          vec3 p = position + vec3(sin(uTime * 0.25 + s) * 0.25, uTime * 0.06 + sin(uTime * 0.3 + s * 2.0) * 0.08, cos(uTime * 0.2 + s) * 0.2);
+          vec4 mv = modelViewMatrix * vec4(p, 1.0);
+          float dist = -mv.z;
+          float coc = abs(dist - uFocus) * 0.045;              // 弥散圈半径（世界单位）
+          float r = 0.006 + coc;
+          gl_PointSize = clamp(2.0 * r * uPx / dist, 1.5, 70.0 * uPx / 1000.0);
+          vA = uAmt * (0.12 + 0.5 * fract(aSeed * 13.7)) * clamp(pow(0.03 / (0.006 + coc), 1.1), 0.05, 1.0) * smoothstep(0.4, 1.5, dist);
+          vSoft = clamp(coc * 20.0, 0.0, 1.0);
+          gl_Position = projectionMatrix * mv;
+        }`,
+      fragmentShader: `
+        uniform vec3 uColor; varying float vA; varying float vSoft;
+        void main() {
+          float d = length(gl_PointCoord - 0.5) * 2.0;
+          float disc = smoothstep(1.0, 0.82, d) * (0.75 + 0.25 * smoothstep(0.5, 0.95, d)); // 光斑：实心圆 + 略亮的边
+          float dot_ = exp(-d * d * 4.0);
+          float a = mix(dot_, disc, vSoft) * vA;
+          if (a < 0.003) discard;
+          gl_FragColor = vec4(uColor * a, 0.0);
+        }`,
+    });
+    dust = new THREE.Points(dg, dustMat);
+    dust.frustumCulled = false; dust.renderOrder = 4;
+    scene.add(dust);
+  }
+
+  // ---------- 相机 ----------
+  const camera = new THREE.PerspectiveCamera(28, W / H, 0.1, 100);
+  // 落版时字宽占画面宽的比例（横屏 / 竖屏）；字越多越长，可适当调大
+  const FILL = W > H ? 0.6 : 0.84;
+  const tanH = Math.tan(THREE.MathUtils.degToRad(camera.fov) / 2) * camera.aspect;
+  const baseDist = Math.max(tw / 2 / FILL / tanH, fitDistance(th * 1.1, camera)) + depthHalf;
+  const LOOK = new THREE.Vector3(0, th * 0.3, 0); // 看向字的下半部：字在画面中线略上，下方留给倒影和标语
+
+  // ---------- 辉光：在 1/8 分辨率重渲一遍发光物体（图层 1：只有字，线性 HDR），取亮部、两级模糊，再加回画面 ----------
+  // 比全分辨率的 UnrealBloomPass 便宜一个数量级（软件渲染下 UnrealBloom + 多重采样目标单帧就超预算）；
+  // 亮度 0.9 以下的不发光，避免整体发灰发糊。
+  const BW = Math.max(2, Math.round(W * DPR / 8)), BH = Math.max(2, Math.round(H * DPR / 8));
+  const rtOpts = { type: THREE.HalfFloatType, depthBuffer: false };
+  const rtScene = new THREE.WebGLRenderTarget(BW, BH, { type: THREE.HalfFloatType });
+  const rtA = new THREE.WebGLRenderTarget(BW >> 1, BH >> 1, rtOpts), rtB = rtA.clone();
+  const rtC = new THREE.WebGLRenderTarget(BW >> 2, BH >> 2, rtOpts), rtD = rtC.clone();
+  const fsCam = new THREE.OrthographicCamera(-1, 1, 1, -1, 0, 1);
+  const fsQuad = new THREE.Mesh(new THREE.PlaneGeometry(2, 2));
+  fsQuad.frustumCulled = false;
+  const fsScene = new THREE.Scene(); fsScene.add(fsQuad);
+  const VS = `varying vec2 vUv; void main() { vUv = uv; gl_Position = vec4(position.xy, 0.0, 1.0); }`;
+  const brightMat = new THREE.ShaderMaterial({
+    uniforms: { tSrc: { value: null }, uTexel: { value: new THREE.Vector2() } }, vertexShader: VS, depthTest: false, depthWrite: false,
+    fragmentShader: `uniform sampler2D tSrc; uniform vec2 uTexel; varying vec2 vUv;
+      void main() {
+        vec3 c = (texture2D(tSrc, vUv + uTexel * vec2(-0.5, -0.5)).rgb + texture2D(tSrc, vUv + uTexel * vec2(0.5, -0.5)).rgb
+                + texture2D(tSrc, vUv + uTexel * vec2(-0.5, 0.5)).rgb + texture2D(tSrc, vUv + uTexel * vec2(0.5, 0.5)).rgb) * 0.25;
+        float l = max(max(c.r, c.g), c.b);
+        float k = clamp((l - 0.9) / 1.2, 0.0, 1.0);          // 软阈值：亮度 0.9 起慢慢进入辉光
+        gl_FragColor = vec4(min(c * k * k, vec3(12.0)), 1.0);
+      }`,
+  });
+  const blurMat = new THREE.ShaderMaterial({
+    uniforms: { tSrc: { value: null }, uDir: { value: new THREE.Vector2() } }, vertexShader: VS, depthTest: false, depthWrite: false,
+    fragmentShader: `uniform sampler2D tSrc; uniform vec2 uDir; varying vec2 vUv;
+      void main() { // 9 抽头高斯，用线性过滤合并成 5 次采样
+        vec3 c = texture2D(tSrc, vUv).rgb * 0.2270270270;
+        c += (texture2D(tSrc, vUv + uDir * 1.3846153846).rgb + texture2D(tSrc, vUv - uDir * 1.3846153846).rgb) * 0.3162162162;
+        c += (texture2D(tSrc, vUv + uDir * 3.2307692308).rgb + texture2D(tSrc, vUv - uDir * 3.2307692308).rgb) * 0.0702702703;
+        gl_FragColor = vec4(c, 1.0);
+      }`,
+  });
+  const mixMat = new THREE.ShaderMaterial({ // 在小分辨率上把两级模糊合成一张，最后全分辨率只采样一次
+    uniforms: { tA: { value: rtA.texture }, tC: { value: rtC.texture }, uStrength: { value: 0.5 } }, vertexShader: VS, depthTest: false, depthWrite: false,
+    fragmentShader: `uniform sampler2D tA, tC; uniform float uStrength; varying vec2 vUv;
+      void main() {
+        vec3 b = (texture2D(tA, vUv).rgb * 0.6 + texture2D(tC, vUv).rgb * 0.9) * uStrength;
+        b = b / (1.0 + b);                                    // 柔和压缩，辉光再强也不会把画面冲白
+        gl_FragColor = vec4(sqrt(b), 1.0);
+      }`,
+  });
+  const compMat = new THREE.ShaderMaterial({
+    vertexShader: `void main() { gl_Position = vec4(position.xy, 0.0, 1.0); }`,
+    depthTest: false, depthWrite: false, transparent: true, blending: THREE.AdditiveBlending, premultipliedAlpha: true,
+    uniforms: { tB: { value: rtB.texture }, uRes: { value: new THREE.Vector2(W * DPR, H * DPR) }, uRect: { value: new THREE.Vector4() } },
+    fragmentShader: `uniform sampler2D tB; uniform vec2 uRes; uniform vec4 uRect;
+      void main() {
+        vec2 uv = gl_FragCoord.xy / uRes, n = uv * 2.0 - 1.0;
+        vec4 d = vec4(n - uRect.xy, uRect.zw - n);              // 到矩形四边的距离；矩形边贴着屏幕边时传入 9，不淡出
+        float fade = smoothstep(0.0, 0.15, min(min(d.x, d.y), min(d.z, d.w)));
+        gl_FragColor = vec4(texture2D(tB, uv).rgb * fade, 0.0);
+      }`,
+  });
+  const compQuad = new THREE.Mesh(new THREE.PlaneGeometry(2, 2), compMat);
+  compQuad.frustumCulled = false;
+  const compScene = new THREE.Scene(); compScene.add(compQuad);
+  const _c = new THREE.Vector3(), logoBox = new THREE.Box3().setFromObject(logo);
+  function glowRect() { // 字的包围盒投影到屏幕（NDC），四周放宽，返回 PlaneGeometry 的 4 个顶点
+    let x0 = 1, x1 = -1, y0 = 1, y1 = -1;
+    for (let i = 0; i < 8; i++) {
+      _c.set(i & 1 ? logoBox.max.x : logoBox.min.x, i & 2 ? logoBox.max.y : logoBox.min.y, i & 4 ? logoBox.max.z : logoBox.min.z).project(camera);
+      x0 = Math.min(x0, _c.x); x1 = Math.max(x1, _c.x); y0 = Math.min(y0, _c.y); y1 = Math.max(y1, _c.y);
+    }
+    const m = 0.35, mx = m * Math.min(1, H / W), my = m * Math.min(1, W / H);
+    x0 = Math.max(-1, x0 - mx); x1 = Math.min(1, x1 + mx); y0 = Math.max(-1, y0 - my); y1 = Math.min(1, y1 + my);
+    compMat.uniforms.uRect.value.set(x0 <= -1 ? -9 : x0, y0 <= -1 ? -9 : y0, x1 >= 1 ? 9 : x1, y1 >= 1 ? 9 : y1); // 矩形边缘柔和淡出，不出现方框
+    return [x0, y1, 0, x1, y1, 0, x0, y0, 0, x1, y0, 0];
+  }
+  const pass = (mat, target) => { fsQuad.material = mat; renderer.setRenderTarget(target); renderer.render(fsScene, fsCam); };
+  function bloom(strength) {
+    camera.layers.set(1);
+    renderer.setRenderTarget(rtScene); renderer.clear(); renderer.render(scene, camera);
+    camera.layers.set(0);
+    brightMat.uniforms.tSrc.value = rtScene.texture; brightMat.uniforms.uTexel.value.set(1 / BW, 1 / BH); pass(brightMat, rtA);
+    blurMat.uniforms.tSrc.value = rtA.texture; blurMat.uniforms.uDir.value.set(1 / rtA.width, 0); pass(blurMat, rtB);
+    blurMat.uniforms.tSrc.value = rtB.texture; blurMat.uniforms.uDir.value.set(0, 1 / rtA.height); pass(blurMat, rtA);
+    blurMat.uniforms.tSrc.value = rtA.texture; blurMat.uniforms.uDir.value.set(0, 0); pass(blurMat, rtC); // 降采样
+    blurMat.uniforms.tSrc.value = rtC.texture; blurMat.uniforms.uDir.value.set(1 / rtC.width, 0); pass(blurMat, rtD);
+    blurMat.uniforms.tSrc.value = rtD.texture; blurMat.uniforms.uDir.value.set(0, 1 / rtC.height); pass(blurMat, rtC);
+    mixMat.uniforms.uStrength.value = strength; pass(mixMat, rtB);
+    renderer.setRenderTarget(null);
+    renderer.render(scene, camera);
+    // 只在字周围的矩形里叠加辉光（全分辨率叠加是这里最贵的一步）
+    compQuad.geometry.attributes.position.array.set(glowRect()); compQuad.geometry.attributes.position.needsUpdate = true;
+    renderer.autoClear = false; renderer.render(compScene, fsCam); renderer.autoClear = true;
+  }
+
+  const tag = document.getElementById('tag');
+  const pxScale = (H * DPR) / (2 * Math.tan(THREE.MathUtils.degToRad(camera.fov) / 2)); // 世界尺寸 → 像素
+
+  draw = (t) => {
+    // 相机：从左上方较远处推近、绕到略偏右的 3/4 角度，后段缓停（最后一秒几乎静止，干净的落版）
+    const p = easeOut(seg(t, 0, DURATION - 0.6));
+    const dist = baseDist * lerp(1.5, 1.0, p), az = lerp(-0.55, 0.13, p), el = lerp(0.42, 0.13, p);
+    camera.position.set(Math.sin(az) * Math.cos(el) * dist, LOOK.y + Math.sin(el) * dist, Math.cos(az) * Math.cos(el) * dist);
+    camera.up.set(0, 1, 0); camera.lookAt(LOOK);
+    camera.rotateZ(lerp(-0.035, 0, p));
+    camera.updateMatrixWorld();
+
+    // 烧入显现 + 发光边
+    const rk = seg(t, REVEAL_START, REVEAL_END);
+    U.uReveal.value = t < REVEAL_START ? -10 : t > REVEAL_END ? 10 : revealX(rk);
+    const edgeAmt = Math.sin(Math.PI * clamp(rk * 1.05)) * 2.2 + (rk > 0 && rk < 1 ? 0.8 : 0);
+    U.uEdge.value.copy(GLOW).multiplyScalar(t > REVEAL_START && t < REVEAL_END + 0.15 ? edgeAmt : 0);
+    // 扫光：一道斜向亮带掠过字面 + 环境整体转动，倒角上的高光线跟着滑动
+    const sk = seg(t, SHINE_START, SHINE_END);
+    U.uShine.value = lerp(-tw * 0.5 - 0.8, tw * 0.5 + 1.0, easeInOut(sk));
+    U.uShineAmt.value = Math.sin(Math.PI * sk) * 1.1;
+    scene.environmentRotation.y = lerp(-0.9, 0.5, easeInOut(seg(t, 0.5, DURATION)));
+    reflMat.envMapRotation.y = scene.environmentRotation.y;
+
+    // 背光、地面光池随显现亮起，完成瞬间有一次闪亮，然后回到稳定值
+    const flash = Math.exp(-((t - REVEAL_END - 0.05) ** 2) / 0.05);
+    const settle = easeOut(seg(t, REVEAL_START, REVEAL_END + 0.6));
+    placeGlow(0.10 + 0.16 * settle + 0.15 * flash);
+    floorMat.uniforms.uPool.value = 0.4 + 1.0 * settle + 0.8 * flash;
+
+    partMat.uniforms.uTime.value = t; partMat.uniforms.uPx.value = pxScale;
+    particles.visible = t < REVEAL_END + 0.4;
+    dustMat.uniforms.uTime.value = t; dustMat.uniforms.uPx.value = pxScale;
+    dustMat.uniforms.uFocus.value = camera.position.distanceTo(LOOK);
+
+    const a = easeOut(seg(t, TAG_START, TAG_START + 0.8));
+    tag.style.opacity = a; tag.style.letterSpacing = `${0.85 - 0.35 * a}em`;
+    tag.style.transform = `translateY(${(1 - a) * 1.2}vmin)`;
+
+    bloom(BLOOM + 0.3 * flash);
+  };
+  // 预热一帧：第 0 帧所有物体（含粒子）都可见，这一帧会编译全部着色器、上传贴图和渲染目标。
+  // （SwiftShader 没有 KHR_parallel_shader_compile，compileAsync 也是串行编译，不比直接画一帧快）
+  draw(0);
+})();
+window.renderFrame = async (t) => { await window.sceneReady; draw(t); };
+</script>
+</body>
+</html>

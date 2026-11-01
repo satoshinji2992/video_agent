@@ -1,0 +1,539 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<!-- 地形飞越：脊状分形 + 侵蚀分形 + 顺坡冲沟的高度场（沿河谷下切出河流），烘焙出坡度/曲率/环境光遮蔽/山影/森林分布；
+     自定义着色器逐像素按坡度、高程、曲率（取自烘焙贴图，不随三角形走）混合岩石/草地/森林/雪/沙，再叠一张平铺细节贴图出颗粒和细节法线；
+     水面单独一层：菲涅尔反射天空、深浅色、太阳碎光、岸边白沫；天空 = 渐变 + 太阳 + 云层，地面有移动的云影，
+     远处有空气透视和贴地高度雾。相机沿河谷样条路径匀速飞行。
+     画面以 2 倍分辨率渲染再缩小（超采样抗锯齿），着色器都按软件渲染（无 GPU）的开销写：少取贴图、少逐像素运算。 -->
+<style>
+  html, body { margin: 0; width: 100%; height: 100%; overflow: hidden; background: #a9c6df; }
+  canvas { display: block; position: fixed; inset: 0; }
+  /* 轻微暗角：用页面叠层做（截图时一起拍进去），不占着色器时间 */
+  #vig { position: fixed; inset: 0; pointer-events: none; background: radial-gradient(farthest-corner at 50% 50%, rgba(0,0,0,0) 0%, rgba(0,0,0,0.016) 25%, rgba(0,0,0,0.0625) 50%, rgba(0,0,0,0.14) 75%, rgba(0,0,0,0.25) 100%); }
+  #hud { position: fixed; inset: 0; font-family: "Noto Sans CJK SC", sans-serif; color: #fff; pointer-events: none; text-shadow: 0 0.3vmin 1.6vmin rgba(10,25,45,0.6), 0 0 0.4vmin rgba(10,25,45,0.35); }
+  #title { position: absolute; left: 7%; right: 7%; top: 9%; font-size: 8vmin; font-weight: 900; letter-spacing: 0.08em; }
+  #sub { position: absolute; left: 7%; right: 7%; top: calc(9% + 11vmin); font-size: 4.4vmin; font-weight: 500; }
+</style>
+<script type="importmap">
+{ "imports": { "three": "/vendor/three/build/three.module.js", "three/addons/": "/vendor/three/examples/jsm/" } }
+</script>
+</head>
+<body>
+<div id="vig"></div><div id="hud"><div id="title">山河之间</div><div id="sub">掠过群峰与湖泊</div></div>
+<script type="module">
+import * as THREE from 'three';
+
+// ==================== 可调参数（改这里就够了） ====================
+const DURATION = 7;            // 镜头时长（秒）
+const SEED = 7;                // 随机种子：换一个整数 = 换一片山
+const PEAK_HEIGHT = 50;        // 群峰最高处的大致高度（世界单位；河谷水面在 0）
+const FAR_RANGE_BOOST = 0.55;  // 远处主峰群额外抬高的比例：0 = 远近一样高
+const WATER_LEVEL = 0;         // 水面高度：低于它的谷底变成河流和湖泊
+const VALLEY_WIDTH = 38;       // 河谷半宽：越大河谷越开阔；0 = 不切河谷（纯山地）
+const EROSION = 1.0;           // 陡坡上顺坡冲沟的深浅：0 = 没有冲沟，1.5 = 很深
+const SNOW_LINE = 40;          // 雪线高度：高于它且坡度不陡的地方积雪
+const TREE_LINE = 20;          // 林线高度：低于它的缓坡长森林
+const SUN_AZIMUTH = -75;       // 太阳方位（度）：0 = 正前方逆光，-90 = 左侧，90 = 右侧，180 = 正后方顺光
+const SUN_ELEVATION = 20;      // 太阳高度角（度）：越低影子越长、光越暖
+const CLOUD_COVER = 0.5;       // 云量 0..1（同时决定地面上云影的多少）
+const HAZE = 1.0;              // 空气透视/雾的浓度倍数：越大远山越淡越蓝
+const FLY_HEIGHT = 12;         // 相机高出航线两侧 ±36、前方 50 范围内最高地形的高度：越大越像高空俯瞰
+const FLY_DISTANCE = 240;      // 整个镜头飞过的距离（世界单位）
+const PITCH = 13;              // 相机俯视角（度）：越大越看地面、天空越少
+const COLORS = {               // 主要配色（十六进制 sRGB，着色器里自动换成线性）
+  zenith: 0x1f63d6, horizon: 0xb9d3ec, sun: 0xfff0d8,
+  grassA: 0x4f7f2c, grassB: 0x7f8a4a, forest: 0x2f5a22, rockA: 0x625a50, rockB: 0xa59b8c,
+  snow: 0xf3f6fb, sand: 0xc9b58c, waterDeep: 0x0c3c52, waterShallow: 0x2f7f86,
+};
+
+// ---------- 准备阶段（异步）：先等字体，再同步建场景（地形与贴图都在这里算好），最后异步编译着色器并预热一帧 ----------
+// 系统在逐帧截图前会 await window.sceneReady（最多 30 秒）；renderFrame 自己也会等它。
+let draw; // 逐帧绘制函数 draw(t)，准备完成后赋值
+window.sceneReady = (async () => {
+  await Promise.all(['500', '700', '900'].map((w) => document.fonts.load(`${w} 64px "Noto Sans CJK SC"`, '中文')));
+
+  const W = innerWidth, H = innerHeight;
+  const clamp = (x, a = 0, b = 1) => Math.min(b, Math.max(a, x));
+  const seg = (t, a, b) => clamp((t - a) / (b - a));
+  const easeOut = (x) => 1 - Math.pow(1 - x, 3);
+  const smooth = (a, b, x) => { const k = clamp((x - a) / (b - a)); return k * k * (3 - 2 * k); };
+
+  // 不开 MSAA：系统以 2 倍分辨率渲染再缩小（超采样），像素比必须跟随 devicePixelRatio
+  const renderer = new THREE.WebGLRenderer({ antialias: false, preserveDrawingBuffer: true });
+  renderer.setPixelRatio(window.devicePixelRatio);
+  renderer.setSize(W, H);
+  // 色调映射（ACES 近似）和 sRGB 编码在自定义着色器末尾自己做（比内置的少几次 pow，软件渲染里省时间）
+  document.body.prepend(renderer.domElement);
+  const scene = new THREE.Scene();
+  window.__three = { renderer, scene };                          // 让系统统计三角形数和贴图数
+
+  // ---------- 噪声：带种子的值噪声（同时给出解析导数，用于“侵蚀分形”） ----------
+  const SEEDH = Math.imul(SEED + 1, 0x9e3779b1);
+  const hash = (ix, iz) => {
+    let h = (Math.imul(ix, 0x27d4eb2d) ^ Math.imul(iz, 0x165667b1) ^ SEEDH) | 0;
+    h = Math.imul(h ^ (h >>> 15), 0x85ebca6b); h = Math.imul(h ^ (h >>> 13), 0xc2b2ae35); h ^= h >>> 16;
+    return (h & 0xffffff) / 8388607.5 - 1;
+  };
+  let NX = 0, NZ = 0; // 最近一次 noise() 的导数
+  function noise(x, z, P = 0) { // 值噪声 [-1,1]；P>0 时按周期 P 平铺（用于无缝贴图）
+    let ix = Math.floor(x), iz = Math.floor(z);
+    const fx = x - ix, fz = z - iz;
+    const ux = fx * fx * fx * (fx * (fx * 6 - 15) + 10), uz = fz * fz * fz * (fz * (fz * 6 - 15) + 10);
+    let ix1 = ix + 1, iz1 = iz + 1;
+    if (P) { ix = ((ix % P) + P) % P; iz = ((iz % P) + P) % P; ix1 = (ix + 1) % P; iz1 = (iz + 1) % P; }
+    const a = hash(ix, iz), b = hash(ix1, iz), c = hash(ix, iz1), d = hash(ix1, iz1);
+    const k1 = b - a, k2 = c - a, k4 = a - b - c + d;
+    NX = 30 * fx * fx * (fx * (fx - 2) + 1) * (k1 + k4 * uz);
+    NZ = 30 * fz * fz * (fz * (fz - 2) + 1) * (k2 + k4 * ux);
+    return a + k1 * ux + k2 * uz + k4 * ux * uz;
+  }
+
+  // ---------- 高度场 ----------
+  // 地图范围：x ∈ [-EXT/2, EXT/2]，z ∈ [Z0-EXT/2, Z0+EXT/2]；相机从 z=START_Z 往 -z 方向飞
+  const EXT = 720, Z0 = -170, N = 640, TEX = EXT / N; // N×N 高度图（每格约 1.1 单位）
+  const START_Z = 150;
+  const valleyX = (z) => 30 * Math.sin(z * 0.011 + 0.6) + 12 * Math.sin(z * 0.027 + 2.0); // 河谷中线（飞行路线跟着它）
+  const R = new Float32Array(N * N), E = new Float32Array(N * N), Hm = new Float32Array(N * N);
+  let rMin = Infinity, rMax = -Infinity;
+  for (let j = 0; j < N; j++) for (let i = 0; i < N; i++) {
+    const x = -EXT / 2 + (i + 0.5) * TEX, z = Z0 - EXT / 2 + (j + 0.5) * TEX;
+    // 1) 域扭曲：让山脉走向弯曲、不呈网格感
+    const qx = x + 28 * noise(x * 0.0045 + 3.1, z * 0.0045 + 1.7), qz = z + 28 * noise(x * 0.0045 - 4.3, z * 0.0045 + 8.2);
+    // 2) 脊状多重分形：尖锐山脊，山脊上叠更细的脊
+    let px = qx * 0.0072, pz = qz * 0.0072, r = 0, amp = 0.55, w = 1;
+    for (let o = 0; o < 6; o++) {
+      let n = 1 - Math.abs(noise(px, pz)); n *= n; n *= w; w = Math.min(1, n * 1.9);
+      r += n * amp; amp *= 0.47;
+      const tx = 1.6 * px - 1.2 * pz + 11.3, tz = 1.2 * px + 1.6 * pz - 7.1; px = tx; pz = tz;
+    }
+    // 3) 侵蚀分形（导数抑制）：坡面上出现冲沟和山嘴，平地保持平缓
+    px = qx * 0.018; pz = qz * 0.018;
+    let e = 0, b = 1, dx = 0, dz = 0;
+    for (let o = 0; o < 7; o++) {
+      const n = noise(px, pz); dx += NX; dz += NZ;
+      e += b * n / (1 + dx * dx + dz * dz); b *= 0.5;
+      const tx = 1.6 * px - 1.2 * pz + 5.7, tz = 1.2 * px + 1.6 * pz + 2.9; px = tx; pz = tz;
+    }
+    R[j * N + i] = r; E[j * N + i] = e;
+    if (r < rMin) rMin = r; if (r > rMax) rMax = r;
+  }
+  for (let j = 0; j < N; j++) for (let i = 0; i < N; i++) {
+    const k = j * N + i, x = -EXT / 2 + (i + 0.5) * TEX, z = Z0 - EXT / 2 + (j + 0.5) * TEX;
+    const rn = (R[k] - rMin) / (rMax - rMin);
+    const boost = 1 + FAR_RANGE_BOOST * smooth(-120, -380, z);
+    let h = PEAK_HEIGHT * Math.pow(rn, 1.55) * boost + E[k] * (3 + 9 * rn) + 3.5;
+    // 河谷：沿中线把地形压到水面以下，两岸平缓抬起
+    if (VALLEY_WIDTH > 0) {
+      const dv = Math.abs(x - valleyX(z)) + 9 * noise(z * 0.021, 3.3) + 4 * noise(x * 0.05, z * 0.05);
+      const vm = smooth(VALLEY_WIDTH * 0.25, VALLEY_WIDTH * 1.7, dv);
+      const floorH = WATER_LEVEL - 2.4 + 1.2 * noise(x * 0.04 + 9, z * 0.04) + 3.2 * clamp(dv / VALLEY_WIDTH);
+      h = floorH + (h - floorH) * vm;
+    }
+    // 地图边缘缓缓落到低处，避免远处出现“切口”
+    const edge = Math.min(x + EXT / 2, EXT / 2 - x, z - (Z0 - EXT / 2), Z0 + EXT / 2 - z);
+    h = 6 + (h - 6) * smooth(0, 50, edge);
+    Hm[k] = h;
+  }
+  // 4) 顺坡冲沟：沿（平滑后的）下坡方向拉长的脊状噪声，只加在陡坡上——像雨水冲出来的沟和山脊肋
+  if (EROSION > 0) {
+    const H2 = new Float32Array(Hm), S = 3;
+    for (let j = S; j < N - S; j++) for (let i = S; i < N - S; i++) {
+      const k = j * N + i, gx = (Hm[k + S] - Hm[k - S]) / (2 * S * TEX), gz = (Hm[k + S * N] - Hm[k - S * N]) / (2 * S * TEX), g = Math.hypot(gx, gz);
+      if (g < 0.12) continue;
+      const x = -EXT / 2 + (i + 0.5) * TEX, z = Z0 - EXT / 2 + (j + 0.5) * TEX, dx = gx / g, dz = gz / g;
+      const along = x * dx + z * dz, across = z * dx - x * dz;
+      let n = 0, a = 1, f = 0.19;
+      for (let o = 0; o < 2; o++) { const r = 1 - Math.abs(noise(across * f + o * 7.1, along * f * 0.1)); n += a * r * r; a *= 0.5; f *= 2.2; }
+      H2[k] += EROSION * 2.6 * smooth(0.12, 0.7, g) * (n - 0.5) * Math.min(1, (Hm[k] - WATER_LEVEL) / 6);
+    }
+    Hm.set(H2);
+  }
+  const heightAt = (x, z) => { // 双线性取高度（世界坐标）
+    const fx = clamp((x + EXT / 2) / TEX - 0.5, 0, N - 1.001), fz = clamp((z - (Z0 - EXT / 2)) / TEX - 0.5, 0, N - 1.001);
+    const i = Math.floor(fx), j = Math.floor(fz), u = fx - i, v = fz - j, k = j * N + i;
+    return (Hm[k] * (1 - u) + Hm[k + 1] * u) * (1 - v) + (Hm[k + N] * (1 - u) + Hm[k + N + 1] * u) * v;
+  };
+
+  // ---------- 烘焙：高度 → 半精度贴图（水深用）；梯度（法线）+ 曲率 → 8 位贴图（地形逐像素取，8 位比半精度取得快）；
+  //            环境光遮蔽 + 山影（软阴影）→ 8 位贴图 ----------
+  const sunDir = new THREE.Vector3(
+    Math.sin(SUN_AZIMUTH * Math.PI / 180) * Math.cos(SUN_ELEVATION * Math.PI / 180),
+    Math.sin(SUN_ELEVATION * Math.PI / 180),
+    -Math.cos(SUN_AZIMUTH * Math.PI / 180) * Math.cos(SUN_ELEVATION * Math.PI / 180)).normalize();
+  const hmData = new Uint16Array(N * N * 4), toHalf = THREE.DataUtils.toHalfFloat, nrm = new Uint8Array(N * N * 4);
+  const enc = (g) => 127.5 + 127.5 * clamp(g / 4, -1, 1);   // 梯度 ±4 线性压进 0..255
+  const at = (i, j) => Hm[clamp(j, 0, N - 1) * N + clamp(i, 0, N - 1)];
+  for (let j = 0; j < N; j++) for (let i = 0; i < N; i++) {
+    const k = j * N + i;
+    const gx = (at(i + 1, j) - at(i - 1, j)) / (2 * TEX), gz = (at(i, j + 1) - at(i, j - 1)) / (2 * TEX);
+    const curv = (at(i + 2, j) + at(i - 2, j) + at(i, j + 2) + at(i, j - 2) - 4 * Hm[k]) / (4 * TEX * TEX); // >0 凹（沟），<0 凸（脊）
+    hmData[k * 4] = toHalf(Hm[k]);
+    nrm[k * 4] = enc(-gx); nrm[k * 4 + 1] = enc(-gz); nrm[k * 4 + 2] = 127.5 + 127.5 * clamp(curv / 0.6, -1, 1); nrm[k * 4 + 3] = 255 * (1 - 1 / Math.sqrt(1 + gx * gx + gz * gz)); // A = 坡度
+  }
+  const nrmTex = new THREE.DataTexture(nrm, N, N);
+  nrmTex.magFilter = nrmTex.minFilter = THREE.LinearFilter; nrmTex.needsUpdate = true;
+  const hmTex = new THREE.DataTexture(hmData, N, N, THREE.RGBAFormat, THREE.HalfFloatType);
+  hmTex.magFilter = hmTex.minFilter = THREE.LinearFilter; hmTex.needsUpdate = true;
+
+  const M = N / 2, TM = EXT / M; // 半分辨率烘焙光照
+  const bake = new Uint8Array(M * M * 4);
+  const sx = sunDir.x / Math.hypot(sunDir.x, sunDir.z), sz = sunDir.z / Math.hypot(sunDir.x, sunDir.z), sTan = sunDir.y / Math.hypot(sunDir.x, sunDir.z);
+  const DIRS = 8;
+  for (let j = 0; j < M; j++) for (let i = 0; i < M; i++) {
+    const x = -EXT / 2 + (i + 0.5) * TM, z = Z0 - EXT / 2 + (j + 0.5) * TM, h0 = heightAt(x, z) + 0.25;
+    // 山影：朝太阳方向步进，记录“离被挡住还差多少”的最小比值 → 半影柔和
+    let sh = 1;
+    for (let d = 1.2; d < 260; d += Math.max(1.2, d * 0.11)) {
+      const dh = h0 + d * sTan - heightAt(x + sx * d, z + sz * d);
+      sh = Math.min(sh, 5 * dh / d);
+      if (sh <= 0) break;
+    }
+    // 环境光遮蔽：8 个方向找地平线仰角
+    let occ = 0;
+    for (let a = 0; a < DIRS; a++) {
+      const ca = Math.cos(a * Math.PI * 2 / DIRS + 0.3), sa = Math.sin(a * Math.PI * 2 / DIRS + 0.3);
+      let mt = 0;
+      for (let d = 1.5; d < 60; d *= 1.55) mt = Math.max(mt, (heightAt(x + ca * d, z + sa * d) - h0) / d);
+      occ += mt / Math.sqrt(1 + mt * mt);
+    }
+    // 大尺度斑驳（草色深浅、森林成片）与森林密度：森林长在林线以下、坡度不陡、偏凹（谷地）的地方
+    let mot = 0.5;
+    for (let o = 0, f = 1 / 48, a = 0.5; o < 3; o++, f *= 2.1, a *= 0.5) mot += a * noise(x * f + 31.7, z * f - 12.4);
+    const gx = (heightAt(x + TM, z) - heightAt(x - TM, z)) / (2 * TM), gz = (heightAt(x, z + TM) - heightAt(x, z - TM)) / (2 * TM);
+    const slope = 1 - 1 / Math.sqrt(1 + gx * gx + gz * gz);
+    const conc = (heightAt(x + 4, z) + heightAt(x - 4, z) + heightAt(x, z + 4) + heightAt(x, z - 4) - 4 * (h0 - 0.25)) / 16;
+    const forest = smooth(0.42, 0.62, mot + conc * 2.5) * (1 - smooth(TREE_LINE - 5, TREE_LINE + 3, h0 + mot * 8)) * (1 - smooth(0.22, 0.4, slope)) * smooth(WATER_LEVEL + 0.8, WATER_LEVEL + 2.2, h0);
+    const k = (j * M + i) * 4;
+    bake[k] = 255 * clamp(1 - occ / DIRS * 1.25); bake[k + 1] = 255 * clamp(sh); bake[k + 2] = 255 * clamp(mot); bake[k + 3] = 255 * forest;
+  }
+  const bakeTex = new THREE.DataTexture(bake, M, M);
+  bakeTex.magFilter = bakeTex.minFilter = THREE.LinearFilter; bakeTex.needsUpdate = true;
+
+  // ---------- 平铺细节纹理（256²，无缝，每 DET_TILE 个单位重复一次）：近处地面靠它出质感 ----------
+  // R = 岩石纹理（脊状分形 + 细颗粒）  G = 树冠颗粒  BA = 细节法线（由 R、G 合成的高度求导）
+  const T = 256, DET_TILE = 12;
+  const detH = new Float32Array(T * T), det = new Uint8Array(T * T * 4);
+  const cellPts = (G, salt) => { const p = []; for (let j = 0; j < G; j++) for (let i = 0; i < G; i++) p.push([(i + 0.5 + 0.45 * hash(i + salt, j)) / G, (j + 0.5 + 0.45 * hash(i, j + salt)) / G]); return p; };
+  const worley = (u, v, G, pts) => { // 返回 [F1, F2]（周期平铺）
+    const ci = Math.floor(u * G), cj = Math.floor(v * G); let f1 = 9, f2 = 9;
+    for (let dj = -1; dj <= 1; dj++) for (let di = -1; di <= 1; di++) {
+      const ii = ((ci + di) % G + G) % G, jj = ((cj + dj) % G + G) % G, q = pts[jj * G + ii];
+      let dx = q[0] - u, dy = q[1] - v; dx -= Math.round(dx); dy -= Math.round(dy);
+      const dd = Math.sqrt(dx * dx + dy * dy) * G;
+      if (dd < f1) { f2 = f1; f1 = dd; } else if (dd < f2) f2 = dd;
+    }
+    return [f1, f2];
+  };
+  const crowns = cellPts(48, 101);
+  for (let j = 0; j < T; j++) for (let i = 0; i < T; i++) {
+    const u = i / T, v = j / T, k = j * T + i;
+    let r = 0, a = 0.5;
+    for (let o = 0, P = 4; o < 6; o++, P *= 2) { r += a * (1 - Math.abs(noise(u * P, v * P, P))); a *= 0.52; }
+    let f = 0; a = 0.5;
+    for (let o = 0, P = 32; o < 3; o++, P *= 2) { f += a * noise(u * P + 17, v * P, P); a *= 0.5; }
+    const [c1] = worley(u, v, 48, crowns);
+    const crown = clamp(1 - c1 * 0.9 + f * 0.3);
+    const rock = clamp(smooth(0.2, 0.95, r) * 1.1 - 0.05 + f * 0.3);   // 大块岩面 + 细颗粒（近处看得出粗糙）
+    detH[k] = rock * 1.0 + crown * 0.18;
+    det[k * 4] = 255 * rock; det[k * 4 + 1] = 255 * crown;
+  }
+  for (let j = 0; j < T; j++) for (let i = 0; i < T; i++) {
+    const k = j * T + i, ip = j * T + (i + 1) % T, im = j * T + (i + T - 1) % T, jp = ((j + 1) % T) * T + i, jm = ((j + T - 1) % T) * T + i;
+    det[k * 4 + 2] = 128 + clamp((detH[im] - detH[ip]) * 200, -127, 127); det[k * 4 + 3] = 128 + clamp((detH[jm] - detH[jp]) * 200, -127, 127);
+  }
+  const mkTex = (data, size) => {
+    const tx = new THREE.DataTexture(data, size, size); tx.wrapS = tx.wrapT = THREE.RepeatWrapping;
+    tx.magFilter = THREE.LinearFilter; tx.minFilter = THREE.LinearMipmapNearestFilter; tx.generateMipmaps = true; tx.needsUpdate = true; return tx;
+  };
+  const detTex = mkTex(det, T);
+
+  // 云：256² 无缝分形（天空里的云层和地面上的云影共用）
+  const C = 256, cloudD = new Float32Array(C * C), cloud = new Uint8Array(C * C * 4);
+  for (let j = 0; j < C; j++) for (let i = 0; i < C; i++) {
+    const u = i / C, v = j / C; let f = 0, a = 0.5;
+    for (let o = 0, P = 4; o < 6; o++, P *= 2) { f += a * noise(u * P + 41, v * P + 7, P); a *= 0.5; }
+    cloudD[j * C + i] = clamp(f * 0.85 + 0.5);
+  }
+  // G 通道 = 云的受光：朝太阳方向几个像素外的密度比这里低 → 这面朝阳更亮（太阳固定，所以预先算好）
+  const offI = Math.round(sunDir.x / Math.hypot(sunDir.x, sunDir.z) * 3), offJ = Math.round(sunDir.z / Math.hypot(sunDir.x, sunDir.z) * 3);
+  for (let j = 0; j < C; j++) for (let i = 0; i < C; i++) {
+    const d0 = cloudD[j * C + i], d1 = cloudD[((j + offJ + C) % C) * C + (i + offI + C) % C];
+    cloud.set([255 * d0, 255 * clamp(0.62 + (d0 - d1) * 5), 0, 255], (j * C + i) * 4);
+  }
+  const cloudTex = mkTex(cloud, C);
+
+  // ---------- 着色器 ----------
+  const col3 = (hex) => new THREE.Color(hex); // 十六进制颜色 → 线性空间
+  const U = {
+    tHM: { value: hmTex }, tNrm: { value: nrmTex }, tBake: { value: bakeTex }, tDet: { value: detTex }, tCloud: { value: cloudTex },
+    uOrigin: { value: new THREE.Vector2(0, Z0) }, uExt: { value: EXT }, uTime: { value: 0 },
+    uSunDir: { value: sunDir }, uSunCol: { value: col3(COLORS.sun).multiplyScalar(4.2) },
+    uZenith: { value: col3(COLORS.zenith) }, uHorizon: { value: col3(COLORS.horizon) },
+    // 天光（背光坡的亮度和色调）与地面反弹光：调大 = 阴影里更亮、不发黑
+    uSkyAmb: { value: col3(COLORS.zenith).lerp(col3(COLORS.horizon), 0.6).multiplyScalar(0.9) }, uBounce: { value: col3(0x8a8050).multiplyScalar(0.26) },
+    uWater: { value: WATER_LEVEL }, uSnow: { value: SNOW_LINE }, uTree: { value: TREE_LINE },
+    uGrassA: { value: col3(COLORS.grassA) }, uGrassB: { value: col3(COLORS.grassB) }, uForest: { value: col3(COLORS.forest) },
+    uRockA: { value: col3(COLORS.rockA) }, uRockB: { value: col3(COLORS.rockB) }, uSnowC: { value: col3(COLORS.snow) }, uSand: { value: col3(COLORS.sand) },
+    uWaterDeep: { value: col3(COLORS.waterDeep) }, uWaterShallow: { value: col3(COLORS.waterShallow) },
+    uCloudH: { value: 170 }, uCloudScale: { value: 1 / 420 }, uCov: { value: 0.9 - CLOUD_COVER * 0.5 }, uWind: { value: new THREE.Vector2(0.0035, 0.0012) },
+    uHaze: { value: 0.001 * HAZE }, uFogH: { value: 0.0014 * HAZE }, uFogFall: { value: 0.06 },
+    uNrmST: { value: new THREE.Vector4(1 / EXT, 1 / EXT, 0.5, 0.5 - Z0 / EXT) },   // 世界 xz → 高度图贴图坐标
+    uExposure: { value: 0.68 }, uDetScale: { value: 1 / DET_TILE },
+  };
+  // 天空函数：天空本身、地形雾色、水面反射都用它，三者天然一致（避免 pow，软件渲染里它很贵）
+  const SKY = /* glsl */`
+    uniform vec3 uSunDir, uSunCol, uZenith, uHorizon;
+    vec3 skyBase(vec3 d) {
+      float e = sqrt(clamp(d.y, 0.0, 1.0));
+      vec3 c = mix(uHorizon, uZenith, e * (2.0 - e));                 // 离开地平线很快变成天顶蓝（晴天感）
+      float s = max(dot(d, uSunDir), 0.0), s2 = s * s, s4 = s2 * s2, s8 = s4 * s4, s32 = s8 * s8 * s8 * s8;
+      return c + uSunCol * (s4 * 0.06 + s32 * s8 * 0.12);           // 太阳一侧的暖色光晕
+    }
+  `;
+  const OUTPUT = /* glsl */`
+    uniform float uExposure;
+    vec4 finalColor(vec3 c) {                                          // ACES 近似（Narkowicz）→ 近似 sRGB（γ = 2）
+      c *= uExposure;
+      c = clamp((c * (2.51 * c + 0.03)) / (c * (2.43 * c + 0.59) + 0.14), 0.0, 1.0);
+      c = sqrt(c);
+      return vec4(c, 1.0);
+    }
+  `;
+  // 顶点里算：烘焙光照、云影、大尺度斑驳/森林密度、空气透视——都随距离缓变；地形和水面共用。
+  // 软件渲染里每个 varying 分量逐像素插值都要花时间，所以全部打包进少数几个 vec4
+  const MACRO_VS = SKY + /* glsl */`
+    uniform sampler2D tBake, tCloud;
+    uniform vec2 uOrigin, uWind; uniform float uExt, uTime, uCloudH, uCloudScale, uCov, uHaze, uFogH, uFogFall;
+    varying vec4 vA;   // xy = 世界坐标 xz（细节贴图坐标），zw = 各材质自己用（地形：细节法线强度、积雪底数）
+    varying vec4 vC;   // x = 天光遮蔽 AO，y = 太阳可见度（山影 × 云影），z = 大尺度斑驳，w = 森林密度
+    varying vec4 vD;   // x = 雾量，y = 雾色偏天顶的比例，z = 雾色里太阳光晕的强度，w = 世界高度
+    void macro(vec3 wp) {
+      vA.xy = wp.xz;
+      vec4 bk = texture2D(tBake, (wp.xz - uOrigin) / uExt + 0.5);
+      vec2 cp = (wp.xz + uSunDir.xz / uSunDir.y * (uCloudH - wp.y)) * uCloudScale + uWind * uTime;
+      float cs = 1.0 - 0.55 * smoothstep(uCov, uCov + 0.18, texture2D(tCloud, cp).r);
+      vC = vec4(bk.r, bk.g * cs, bk.b, bk.a);
+      vec3 toP = wp - cameraPosition; float dist = length(toP); vec3 V = toP / dist;
+      // 空气透视：距离雾（近处不起雾）+ 贴地的高度雾（越低越浓），颜色取同方向的天空（和 skyBase 同一公式）
+      float fy = abs(V.y) < 1e-3 ? 1e-3 : V.y;
+      float hf = uFogH * exp(-cameraPosition.y * uFogFall) * (1.0 - exp(-dist * fy * uFogFall)) / (fy * uFogFall);
+      vec3 Vf = normalize(vec3(V.x, max(V.y, 0.0) * 0.4, V.z));
+      float s = max(dot(Vf, uSunDir), 0.0), s2 = s * s, s4 = s2 * s2, s8 = s4 * s4, s32 = s8 * s8 * s8 * s8;
+      vD = vec4(1.0 - exp(-max(dist - 50.0, 0.0) * uHaze - hf * smoothstep(30.0, 160.0, dist)), sqrt(Vf.y), s4 * 0.06 + s32 * s8 * 0.12, wp.y);
+    }
+  `;
+  const FOG_FS = /* glsl */`
+    varying vec4 vD;
+    vec3 applyFog(vec3 col) {   // 远处先偏蓝再融进天色
+      vec3 fogC = mix(uHorizon, uZenith, vD.y * (2.0 - vD.y)) + uSunCol * vD.z;
+      return mix(col * mix(vec3(1.0), vec3(0.86, 0.93, 1.05), vD.x), fogC, vD.x);
+    }
+  `;
+  // 地形：高度、梯度（法线）、曲率逐像素从高度图取（顶点只负责形状），所以雪线、岩石分界和明暗不会沿三角形边走、山体不显“多边形感”；
+  // 细节贴图取两次：一次常规尺度，一次 3.7 倍细（只在近处起作用），近处地面才有清晰的颗粒，而不是糊成一片
+  const terrainMat = new THREE.ShaderMaterial({
+    uniforms: U, fog: false, toneMapped: false,
+    vertexShader: MACRO_VS + /* glsl */`
+      uniform float uSnow;
+      void main() {
+        vec4 wp = modelMatrix * vec4(position, 1.0); macro(wp.xyz);
+        // 顶点里能算的都在这里算好（逐像素越少越快）：z = 细节法线强度（远处随雾减弱、近处加强），w = 积雪的高度底数
+        vA.z = 1.0 - vD.x + 0.6 * (1.0 - smoothstep(20.0, 75.0, distance(wp.xyz, cameraPosition)));
+        vA.w = (wp.y + (vC.z - 0.5) * 14.0 - uSnow) * 0.25 + 0.5;
+        vC.z = smoothstep(0.3, 0.8, vC.z);
+        gl_Position = projectionMatrix * viewMatrix * wp;
+      }`,
+    fragmentShader: SKY + OUTPUT + FOG_FS + /* glsl */`
+      uniform sampler2D tDet, tNrm; uniform float uDetScale, uWater, uTree; uniform vec4 uNrmST;
+      uniform vec3 uSkyAmb, uBounce, uGrassA, uGrassB, uForest, uRockA, uRockB, uSnowC, uSand;
+      varying vec4 vA, vC;
+      void main() {
+        vec4 nc = texture2D(tNrm, vA.xy * uNrmST.xy + uNrmST.zw);       // xy = 梯度，z = 曲率，w = 坡度
+        vec2 grad = nc.xy * 8.0 - 4.0;
+        vec4 d = texture2D(tDet, vA.xy * uDetScale);
+        float jr = d.r - 0.5, jg = d.g - 0.5;
+        float slope = nc.w, curv = nc.z * 1.2 - 0.6, hw = vD.w - uWater;
+        // ---- 材质权重：坡度 / 高程 / 曲率 + 细节噪声，把分界线打碎 ----
+        // 林线以下的陡坡也长草木（只有很陡的崖壁露岩），越往上岩石越多
+        float rockW = smoothstep(0.19, 0.33, slope + vC.z * 0.1 - 0.05 - curv * 0.1 + jr * 0.16 - clamp((uTree - vD.w) * 0.008, 0.0, 0.12));
+        float snowW = smoothstep(0.0, 1.0, min(vA.w + curv * 1.5 + jr * 0.8,
+                                               (0.56 - slope) * 6.0 - jr * 1.6));   // 雪积在高处的缓坡和沟里，陡壁露岩
+        float sandW = clamp(1.3 - (hw + jg * 0.3) * 1.8, 0.0, 1.0);
+        float forestW = smoothstep(0.3, 0.7, vC.w + jg * 0.6) * (1.0 - rockW);
+        // ---- 反照率 ----
+        vec3 alb = mix(mix(uGrassA, uGrassB, vC.z) * (0.78 + 0.44 * d.g), uForest * (0.45 + d.g), forestW);   // 草地斑驳 / 树冠颗粒
+        alb = mix(alb, uSand * (0.85 + 0.3 * d.g), sandW);
+        float rk = clamp(0.5 + jr * 1.6, 0.0, 1.0);
+        alb = mix(alb, mix(uRockA, uRockB, rk) * (0.955 + 0.18 * abs(fract(hw * 0.22 + d.r * 0.8) - 0.5)), rockW);   // 岩石 + 岩层横纹
+        alb = mix(alb, uSnowC * (0.9 + 0.12 * d.r), snowW);
+        alb *= 0.7 + 0.3 * clamp(hw * 2.9, 0.0, 1.0);                     // 岸边湿沙
+        // ---- 细节法线（远处随雾减弱）；光照 = 暖色太阳（烘焙山影 × 云影）+ 冷色天光与地面反弹（烘焙 AO × 曲率：脊亮沟暗） ----
+        vec2 dn = grad + ((d.ba - 0.5) * (0.35 + 0.9 * rockW - 0.2 * snowW) * vA.z);
+        vec3 N = normalize(vec3(dn.x, 1.0, dn.y));
+        float ao = vC.x * clamp(1.0 - curv * 1.2, 0.6, 1.25) * (1.0 - forestW * (0.25 - 0.25 * d.g));
+        vec3 amb = (uSkyAmb * (0.6 + 0.4 * N.y) + uBounce * (0.6 - 0.4 * N.y)) * ao;
+        vec3 col = alb * (uSunCol * (max(dot(N, uSunDir), 0.0) * vC.y) + amb);
+        gl_FragColor = finalColor(applyFog(col));
+      }`,
+  });
+  // 水面：只铺在低于水位的格子上，先于地形绘制；露出水面的地形会把它挡住，岸线就是几何交线
+  const waterMat = new THREE.ShaderMaterial({
+    uniforms: U, fog: false, toneMapped: false,
+    vertexShader: MACRO_VS + /* glsl */`
+      uniform sampler2D tHM; uniform float uWater;
+      varying float vDepth;
+      void main() {
+        vec4 wp = modelMatrix * vec4(position, 1.0); macro(wp.xyz);
+        vDepth = uWater - texture2D(tHM, (wp.xz - uOrigin) / uExt + 0.5).x;
+        gl_Position = projectionMatrix * viewMatrix * wp;
+      }`,
+    fragmentShader: SKY + OUTPUT + FOG_FS + /* glsl */`
+      uniform sampler2D tDet;
+      uniform float uTime, uWater;
+      uniform vec3 uSkyAmb, uSand, uWaterDeep, uWaterShallow;
+      varying vec4 vA, vC;
+      varying float vDepth;
+      void main() {
+        vec3 V = normalize(vec3(vA.x, uWater, vA.y) - cameraPosition);
+        float depth = max(vDepth, 0.0);
+        vec4 d = texture2D(tDet, vA.xy / 6.0 + vec2(0.05, 0.03) * uTime);
+        // 波纹法线：细节贴图（缓慢漂移）+ 两组移动的长波
+        vec2 p = vA.xy, g = (d.ba - 0.5) * 0.4;
+        g += vec2(0.8, 0.6) * cos(dot(p, vec2(0.8, 0.6)) * 0.7 + d.r * 3.0 + uTime * 1.5) * 0.02;
+        g += vec2(-0.5, 0.86) * cos(dot(p, vec2(-0.5, 0.86)) * 1.7 + d.g * 3.0 + uTime * 2.2) * 0.015;
+        vec3 Nw = normalize(vec3(g.x, 1.0, g.y));
+        vec3 Rf = reflect(V, Nw); Rf.y = abs(Rf.y);
+        float c1 = 1.0 - max(dot(-V, Nw), 0.0), c2 = c1 * c1;
+        float fres = 0.02 + 0.98 * c2 * c2 * c1;                          // 菲涅尔：越平视越像镜子
+        vec3 amb = uSkyAmb * 1.1 + uSunCol * 0.12 * vC.y;
+        vec3 body = mix(uWaterShallow, uWaterDeep, smoothstep(0.0, 2.0, depth));
+        body = mix(uSand * 0.5, body, smoothstep(0.0, 0.6, depth)) * amb;  // 浅处透出沙底，深处变暗
+        vec3 col = mix(body, skyBase(Rf) * mix(0.6, 1.0, vC.y), fres);
+        float sg = max(dot(Rf, uSunDir), 0.0), sg2 = sg * sg, sg4 = sg2 * sg2, sg16 = sg4 * sg4 * sg4 * sg4;
+        col += uSunCol * sg16 * sg16 * sg16 * 1.6 * vC.y;                 // 太阳在水面上的碎光
+        float foam = smoothstep(0.14, 0.0, depth + (d.r - 0.5) * 0.16) * (0.4 + 0.6 * d.g);   // 岸边白沫（细细一圈）
+        col = mix(col, vec3(0.9, 0.93, 0.95) * (amb + uSunCol * 0.5 * vC.y), foam * 0.5);
+        gl_FragColor = finalColor(applyFog(col));
+      }`,
+  });
+
+  // ---------- 地形网格：分块 + LOD（近处细、远处粗），块边带“裙边”遮住接缝 ----------
+  const CH = 8, CS = EXT / CH; // 8×8 块
+  const LODS = [[64, 0], [32, 120], [16, 260]]; // [每块格数, 起用距离]
+  const indexCache = {};
+  function chunkGeo(cx, cz, res) {
+    const n = res + 1, verts = new Float32Array((n * n + 4 * n) * 3);
+    let v = 0;
+    for (let j = 0; j < n; j++) for (let i = 0; i < n; i++) {
+      const x = (i / res - 0.5) * CS, z = (j / res - 0.5) * CS;
+      verts[v++] = x; verts[v++] = heightAt(cx + x, cz + z); verts[v++] = z;
+    }
+    const ring = [];
+    for (let i = 0; i < n; i++) ring.push(i);                 // 上边
+    for (let j = 0; j < n; j++) ring.push(j * n + res);       // 右边
+    for (let i = res; i >= 0; i--) ring.push(res * n + i);    // 下边
+    for (let j = res; j >= 0; j--) ring.push(j * n);          // 左边
+    const base = n * n;
+    for (let r = 0; r < 4 * n; r++) { const s = ring[r] * 3; verts[v++] = verts[s]; verts[v++] = verts[s + 1] - 3; verts[v++] = verts[s + 2]; }
+    if (!indexCache[res]) {
+      const idx = [];
+      for (let j = res - 1; j >= 0; j--) for (let i = 0; i < res; i++) { const a = j * n + i, b = a + 1, c = a + n, d = c + 1; idx.push(a, c, b, b, c, d); }
+      for (let r = 0; r < 4 * n - 1; r++) { const a = ring[r], b = ring[r + 1], c = base + r, d = base + r + 1; idx.push(a, b, c, b, d, c); }
+      indexCache[res] = idx;
+    }
+    const g = new THREE.BufferGeometry();
+    g.setAttribute('position', new THREE.BufferAttribute(verts, 3));
+    g.setIndex(indexCache[res]);
+    g.computeBoundingSphere();
+    return g;
+  }
+  for (let cj = 0; cj < CH; cj++) for (let ci = 0; ci < CH; ci++) {
+    const cx = -EXT / 2 + (ci + 0.5) * CS, cz = Z0 - EXT / 2 + (cj + 0.5) * CS;
+    const lod = new THREE.LOD(); // LOD 按“相机到块中心”的距离切换
+    for (const [res, d] of LODS) lod.addLevel(new THREE.Mesh(chunkGeo(cx, cz, res), terrainMat), d);
+    lod.position.set(cx, 0, cz);
+    scene.add(lod);
+    // 这一块里低于水位的格子铺成水面（每格 = 两个烘焙像素）
+    const wv = [], step = TM * 2, nW = Math.round(CS / step);
+    for (let j = 0; j < nW; j++) for (let i = 0; i < nW; i++) {
+      const x0 = cx - CS / 2 + i * step, z0 = cz - CS / 2 + j * step;
+      let lo = Infinity;
+      for (let a = 0; a <= 2; a++) for (let b = 0; b <= 2; b++) lo = Math.min(lo, heightAt(x0 + a * step / 2, z0 + b * step / 2));
+      if (lo < WATER_LEVEL + 0.2) wv.push(x0, WATER_LEVEL, z0, x0, WATER_LEVEL, z0 + step, x0 + step, WATER_LEVEL, z0, x0 + step, WATER_LEVEL, z0, x0, WATER_LEVEL, z0 + step, x0 + step, WATER_LEVEL, z0 + step);
+    }
+    if (wv.length) {
+      const g = new THREE.BufferGeometry(); g.setAttribute('position', new THREE.Float32BufferAttribute(wv, 3)); g.computeBoundingSphere();
+      const w = new THREE.Mesh(g, waterMat); w.renderOrder = -1; scene.add(w);
+    }
+  }
+
+  // ---------- 天空：渐变 + 太阳 + 云层（画在远平面、最后绘制，只算没被地形挡住的像素） ----------
+  // 渐变、光晕、云的远淡都随方向缓变，放在顶点里算（球面分得够细，看不出插值）；逐像素只取云贴图和太阳圆盘
+  const skyMat = new THREE.ShaderMaterial({
+    uniforms: U, side: THREE.BackSide, depthWrite: false, depthFunc: THREE.LessEqualDepth, fog: false, toneMapped: false,
+    vertexShader: SKY + /* glsl */`
+      uniform float uCloudH;
+      varying vec3 vDir, vSky; varying vec2 vF;   // vSky = 天空底色，vF.x = 云的远淡（贴地平线的云融进天色），vF.y = 云朝阳一侧的暖色
+      void main() {
+        vDir = position; vec3 d = normalize(position);
+        vSky = skyBase(d);
+        float s = max(dot(d, uSunDir), 0.0), s2 = s * s, s8 = s2 * s2 * s2 * s2;
+        vF = vec2(d.y > 0.0 ? exp(-(uCloudH - cameraPosition.y) / max(d.y, 1e-3) * 0.0011) * 0.92 : 0.0, s8 * s2 * 0.25);
+        vec4 p = projectionMatrix * viewMatrix * vec4(position * 1000.0 + cameraPosition, 1.0); gl_Position = p.xyww;
+      }`,
+    fragmentShader: OUTPUT + /* glsl */`
+      uniform sampler2D tCloud; uniform vec2 uWind; uniform vec3 uSunDir, uSunCol, uHorizon; uniform float uTime, uCloudH, uCloudScale, uCov;
+      varying vec3 vDir, vSky; varying vec2 vF;
+      void main() {
+        float s = dot(vDir, uSunDir) * inversesqrt(dot(vDir, vDir));
+        vec3 c = vSky + uSunCol * 6.0 * smoothstep(0.99955, 0.99985, s);   // 太阳圆盘
+        // 云层：一个水平面，按视线与它的交点取云贴图
+        vec4 cl = texture2D(tCloud, (cameraPosition.xz + vDir.xz * ((uCloudH - cameraPosition.y) / max(vDir.y, 1e-3))) * uCloudScale + uWind * uTime);
+        vec3 cc = mix(uHorizon * 0.7 + vec3(0.03, 0.04, 0.06), vec3(1.2, 1.18, 1.14), cl.g) + uSunCol * vF.y;
+        gl_FragColor = finalColor(mix(c, cc, smoothstep(uCov, uCov + 0.22, cl.r) * vF.x));
+      }`,
+  });
+  const sky = new THREE.Mesh(new THREE.SphereGeometry(1, 64, 48), skyMat);
+  sky.frustumCulled = false; sky.renderOrder = 1; scene.add(sky);
+
+  // ---------- 飞行路径：沿河谷中线，高度取前方与两侧的最高地形再加 FLY_HEIGHT，平滑后不穿山 ----------
+  const K = 14, ys = [], xs = [], zs = [];
+  for (let k = 0; k <= K; k++) {
+    const z = START_Z - (FLY_DISTANCE + 70) * k / K, x = valleyX(z) * 0.9;
+    let g = WATER_LEVEL;
+    for (let dx = -36; dx <= 36; dx += 4) for (let dz = -50; dz <= 8; dz += 4) g = Math.max(g, heightAt(x + dx, z + dz));
+    xs.push(x); zs.push(z); ys.push(g + FLY_HEIGHT);
+  }
+  for (let pass = 0; pass < 2; pass++) { const c = ys.slice(); for (let k = 0; k <= K; k++) ys[k] = Math.max(c[k], 0.5 * c[k] + 0.25 * (c[Math.max(k - 1, 0)] + c[Math.min(k + 1, K)])); }
+  const path = new THREE.CatmullRomCurve3(xs.map((x, k) => new THREE.Vector3(x, ys[k], zs[k])), false, 'centripetal');
+  const camera = new THREE.PerspectiveCamera(W > H ? 50 : 62, W / H, 0.5, 1400);
+  const hudTitle = document.getElementById('title'), hudSub = document.getElementById('sub');
+  const ahead = new THREE.Vector3(), tA = new THREE.Vector3(), tB = new THREE.Vector3();
+  const pathFrac = FLY_DISTANCE / (FLY_DISTANCE + 70);
+
+  draw = (t) => {
+    const u = pathFrac * (t / DURATION);              // 匀速飞行（飞越镜头不要缓停）
+    path.getPointAt(u, camera.position);
+    path.getTangentAt(Math.min(u + 0.04, 1), tA);     // 朝向看稍前方的切线，转弯更顺
+    ahead.set(tA.x, 0, tA.z).normalize();
+    ahead.y = -Math.tan(PITCH * Math.PI / 180);       // 固定俯视角，不随路径起伏抬头低头
+    ahead.add(camera.position);
+    camera.lookAt(ahead);
+    path.getTangentAt(Math.min(u + 0.1, 1), tB);
+    const turn = Math.atan2(tA.x, -tA.z) - Math.atan2(tB.x, -tB.z);
+    camera.rotateZ(clamp(turn * 0.6, -0.06, 0.06));  // 转弯时轻微侧倾（最多约 3.5°）
+    U.uTime.value = t;
+    const a = easeOut(seg(t, 0.5, 1.5)), b = easeOut(seg(t, 1.0, 2.0));
+    hudTitle.style.opacity = a; hudTitle.style.letterSpacing = `${0.3 - 0.22 * a}em`;
+    hudSub.style.opacity = b;
+    renderer.render(scene, camera);
+  };
+  await renderer.compileAsync(scene, camera);
+  draw(0);
+})();
+window.renderFrame = async (t) => { await window.sceneReady; draw(t); };
+</script>
+</body>
+</html>

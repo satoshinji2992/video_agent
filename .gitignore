@@ -1,0 +1,37 @@
+node_modules/
+data/
+BUILD.json
+
+# Secrets: only the example file is shared.
+.env
+.env.*
+!.env.example
+
+# Agent skills: our own (video-3d) is tracked; third-party skills are installed with
+# `npm run skill:add <git-url>` and stay out of the repo (see README).
+skills/*
+!skills/video-3d/
+
+# Local reference media (e.g. the Grok reference video in the repo root).
+/*.mp4
+
+# Benchmark asset packs: downloaded and unpacked by benchmark/scripts/fetch-packs.sh.
+benchmark/packs/*/
+benchmark/packs/*.zip
+
+# Benchmark run outputs and generator work folders.
+benchmark/harness/node_modules
+benchmark/harness/.venv/
+benchmark/harness/data/
+benchmark/harness/runs/
+benchmark/harness/logs/
+benchmark/harness/notes/
+benchmark/harness/vab*/
+benchmark/harness/report-*.md
+benchmark/tools/work/
+benchmark/tools/log/
+benchmark/tools/tmp/
+benchmark/tools/data/
+
+# Outdated export of docs/agent-architecture.md; the .md and .drawio are the sources.
+docs/agent-architecture.pdf

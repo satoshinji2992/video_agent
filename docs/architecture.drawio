@@ -1,0 +1,108 @@
+<mxfile host="app.diagrams.net" agent="Claude Code" version="24.0.0">
+  <diagram id="video-agent-arch" name="架构">
+    <mxGraphModel dx="1300" dy="700" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="1320" pageHeight="680" math="0" shadow="0">
+      <root>
+        <mxCell id="0" />
+        <mxCell id="1" parent="0" />
+
+        <mxCell id="title" value="&lt;b&gt;video agent 架构&lt;/b&gt;" style="text;html=1;fontSize=20;align=left;verticalAlign=middle;" vertex="1" parent="1">
+          <mxGeometry x="40" y="10" width="300" height="40" as="geometry" />
+        </mxCell>
+
+        <!-- Groups -->
+        <mxCell id="g_ecs" value="云服务器" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f7f9fc;strokeColor=#6c8ebf;verticalAlign=top;align=left;spacingLeft=10;fontStyle=1;arcSize=3;strokeWidth=2;" vertex="1" parent="1">
+          <mxGeometry x="240" y="70" width="770" height="580" as="geometry" />
+        </mxCell>
+        <mxCell id="g_relay" value="中转站" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fdf0f0;strokeColor=#b85450;verticalAlign=top;align=left;spacingLeft=10;fontStyle=1;arcSize=5;" vertex="1" parent="1">
+          <mxGeometry x="1060" y="80" width="220" height="350" as="geometry" />
+        </mxCell>
+
+        <!-- Nodes -->
+        <mxCell id="browser" value="浏览器" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffffff;strokeColor=#666666;fontStyle=1;" vertex="1" parent="1">
+          <mxGeometry x="40" y="280" width="150" height="60" as="geometry" />
+        </mxCell>
+        <mxCell id="nginx" value="Nginx" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;fontStyle=1;" vertex="1" parent="1">
+          <mxGeometry x="270" y="280" width="110" height="60" as="geometry" />
+        </mxCell>
+        <mxCell id="agent" value="&lt;b&gt;Agent&lt;/b&gt;&lt;br&gt;Claude Agent SDK" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;" vertex="1" parent="1">
+          <mxGeometry x="430" y="260" width="170" height="100" as="geometry" />
+        </mxCell>
+        <mxCell id="tools" value="&lt;b&gt;工作室工具&lt;/b&gt;&lt;br&gt;分镜 · 动画 · 实拍 · 合成" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#e1d5e7;strokeColor=#9673a6;" vertex="1" parent="1">
+          <mxGeometry x="660" y="200" width="150" height="60" as="geometry" />
+        </mxCell>
+        <mxCell id="skills" value="&lt;b&gt;技能&lt;/b&gt;&lt;br&gt;只读" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#e1d5e7;strokeColor=#9673a6;" vertex="1" parent="1">
+          <mxGeometry x="660" y="330" width="150" height="60" as="geometry" />
+        </mxCell>
+        <mxCell id="render" value="&lt;b&gt;渲染&lt;/b&gt;&lt;br&gt;Chrome + FFmpeg" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;" vertex="1" parent="1">
+          <mxGeometry x="850" y="200" width="130" height="60" as="geometry" />
+        </mxCell>
+        <mxCell id="ledger" value="&lt;b&gt;花费账本&lt;/b&gt;&lt;br&gt;上限 $100" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;" vertex="1" parent="1">
+          <mxGeometry x="850" y="330" width="130" height="60" as="geometry" />
+        </mxCell>
+        <mxCell id="storage" value="&lt;b&gt;本地磁盘&lt;/b&gt;&lt;br&gt;会话 · 成片 · 轨迹" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fff8e6;strokeColor=#d6b656;" vertex="1" parent="1">
+          <mxGeometry x="430" y="520" width="170" height="60" as="geometry" />
+        </mxCell>
+        <mxCell id="skilllib" value="&lt;b&gt;技能库&lt;/b&gt;&lt;br&gt;video-shotcraft" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fff8e6;strokeColor=#d6b656;" vertex="1" parent="1">
+          <mxGeometry x="660" y="520" width="150" height="60" as="geometry" />
+        </mxCell>
+        <mxCell id="claude" value="&lt;b&gt;Claude&lt;/b&gt;&lt;br&gt;opus-5-5" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffffff;strokeColor=#b85450;" vertex="1" parent="1">
+          <mxGeometry x="1080" y="120" width="180" height="60" as="geometry" />
+        </mxCell>
+        <mxCell id="seedance" value="&lt;b&gt;Seedance&lt;/b&gt;&lt;br&gt;480p" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffffff;strokeColor=#b85450;" vertex="1" parent="1">
+          <mxGeometry x="1080" y="330" width="180" height="60" as="geometry" />
+        </mxCell>
+        <mxCell id="github" value="GitHub" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f5f5f5;strokeColor=#666666;fontStyle=1;" vertex="1" parent="1">
+          <mxGeometry x="1080" y="520" width="180" height="60" as="geometry" />
+        </mxCell>
+        <mxCell id="dev" value="开发机" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f5f5f5;strokeColor=#666666;fontStyle=1;" vertex="1" parent="1">
+          <mxGeometry x="40" y="520" width="150" height="60" as="geometry" />
+        </mxCell>
+
+        <!-- Edges -->
+        <mxCell id="e1" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;endArrow=block;strokeWidth=2;" edge="1" parent="1" source="browser" target="nginx">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e2" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;endArrow=block;strokeWidth=2;" edge="1" parent="1" source="nginx" target="agent">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e3" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;endArrow=block;strokeWidth=2;strokeColor=#b85450;exitX=0.5;exitY=0;exitDx=0;exitDy=0;entryX=0;entryY=0.5;entryDx=0;entryDy=0;" edge="1" parent="1" source="agent" target="claude">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="515" y="150" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="e4" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;endArrow=block;exitX=1;exitY=0.3;exitDx=0;exitDy=0;entryX=0;entryY=0.5;entryDx=0;entryDy=0;" edge="1" parent="1" source="agent" target="tools">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e5" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;endArrow=block;exitX=1;exitY=0.7;exitDx=0;exitDy=0;entryX=0;entryY=0.5;entryDx=0;entryDy=0;" edge="1" parent="1" source="agent" target="skills">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e6" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;endArrow=block;" edge="1" parent="1" source="tools" target="render">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e7" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;endArrow=block;strokeWidth=2;strokeColor=#b85450;exitX=0.5;exitY=1;exitDx=0;exitDy=0;entryX=0;entryY=0.5;entryDx=0;entryDy=0;" edge="1" parent="1" source="tools" target="seedance">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="735" y="295" />
+              <mxPoint x="1030" y="295" />
+              <mxPoint x="1030" y="360" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="e8" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;endArrow=block;dashed=1;" edge="1" parent="1" source="skills" target="skilllib">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e9" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;endArrow=block;dashed=1;" edge="1" parent="1" source="agent" target="storage">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e10" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;endArrow=block;" edge="1" parent="1" source="github" target="skilllib">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e11" value="rsync" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;endArrow=block;labelBackgroundColor=#ffffff;" edge="1" parent="1" source="dev" target="storage">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+      </root>
+    </mxGraphModel>
+  </diagram>
+</mxfile>

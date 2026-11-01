@@ -1,0 +1,458 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<!-- 三维柱状图（发布会质感）：圆角亮面柱错峰生长（数值同步滚动），深色镜面地台带网格、倒影、接触阴影，
+     环境光 + 主光 + 轮廓光，最后高亮重点柱（金色从柱底扫到柱顶、底部光圈、数值变胶囊徽章），相机从低机位升到 3/4 俯视。 -->
+<style>
+  /* 背景：上层是四周压暗（暗角），下层是中心亮的径向渐变。都放在 body 背景里（单独一层盖在画面上每帧多 5ms 截图时间） */
+  html, body { margin: 0; width: 100%; height: 100%; overflow: hidden;
+    background: radial-gradient(120% 90% at 50% 50%, transparent 55%, rgba(2, 4, 10, 0.55) 100%), radial-gradient(130% 75% at 50% 42%, #18284a 0%, #0c1426 55%, #060a14 100%); }
+  canvas { display: block; position: fixed; inset: 0; }
+  #hud { position: fixed; inset: 0; font-family: "Noto Sans CJK SC", sans-serif; color: #fff; pointer-events: none; }
+  #title { position: absolute; left: 7%; right: 7%; top: 7%; font-size: 6.6vmin; font-weight: 900; letter-spacing: 0.02em; text-shadow: 0 0.4vmin 2vmin rgba(0, 0, 0, 0.45); }
+  /* 标题前的强调色短竖条（装饰，不是文字位） */
+  #title::before { content: ''; display: inline-block; width: 1vmin; height: 0.95em; margin-right: 1.8vmin; vertical-align: -0.12em; border-radius: 0.5vmin; background: linear-gradient(180deg, #ffc964, #ff9a2e); }
+  #sub { position: absolute; left: 7%; right: 7%; top: calc(7% + 9.5vmin); font-size: 3.4vmin; font-weight: 500; color: #9fb1d4; padding-left: 2.8vmin; }
+  @media (max-aspect-ratio: 1/1) { #title, #sub { top: 9%; } #sub { top: calc(9% + 9.5vmin); } }
+</style>
+<script type="importmap">
+{ "imports": { "three": "/vendor/three/build/three.module.js", "three/addons/": "/vendor/three/examples/jsm/" } }
+</script>
+</head>
+<body>
+<div id="hud"><div id="title">上半年销售额</div><div id="sub">单位：万元 · 示例数据</div></div>
+<script type="module">
+import * as THREE from 'three';
+
+// ---------- 准备阶段（异步）：先等字体，再同步建场景，最后异步编译着色器并预热一帧 ----------
+// 系统在逐帧截图前会 await window.sceneReady（最多 30 秒）；renderFrame 自己也会等它。
+let draw; // 逐帧绘制函数 draw(t)，准备完成后赋值
+window.sceneReady = (async () => {
+  // 系统字体（Noto Sans CJK SC）不走网络，但仍先 load，确保画布写中文时字体已就绪
+  await Promise.all(['500', '700', '900'].map((w) => document.fonts.load(`${w} 64px "Noto Sans CJK SC"`, '中文0123456789')));
+
+  // ---------- 可改参数 ----------
+  const DURATION = 6;                               // 镜头秒数，按计划改
+  const DATA = [['一月', 320], ['二月', 410], ['三月', 380], ['四月', 520], ['五月', 610], ['六月', 760]]; // [类目, 数值]，3~8 根最好看
+  const MAXV = 800;                                 // 纵轴满刻度（比最大值略大），柱高 = 数值 / MAXV
+  const TICK = 200;                                 // 背板刻度线间隔；0 = 不画刻度
+  const HIGHLIGHT = -1;                             // 高亮第几根（从 0 数）；-1 = 自动取最大值；null = 不高亮
+  const COLOR_LOW = '#2a4dff', COLOR_HIGH = '#16b8ff'; // 普通柱颜色：数值小 → 数值大 渐变
+  const ACCENT = '#ffa21f';                         // 高亮色（重点柱、光圈、徽章）
+  const GROW_AT = 0.5, GROW_STAGGER = 0.2, GROW_LEN = 1.4; // 第 i 根从 GROW_AT + i*GROW_STAGGER 秒开始长，长 GROW_LEN 秒
+  const HIGHLIGHT_AT = 3.2, HIGHLIGHT_LEN = 0.6;     // 高亮开始的秒数、金色从柱底扫到柱顶用的秒数
+  const fmt = (v) => Math.round(v).toLocaleString('en-US'); // 数值显示格式（千分位）；要小数/单位在这里改
+
+  // ---------- 通用：尺寸、时间工具 ----------
+  const W = innerWidth, H = innerHeight, DPR = window.devicePixelRatio || 1;
+  const portrait = W <= H;
+  const clamp = (x, a = 0, b = 1) => Math.min(b, Math.max(a, x));
+  const seg = (t, a, b) => clamp((t - a) / (b - a)); // t 在 [a,b] 内的进度 0..1
+  const easeInOut = (x) => (x < 0.5 ? 4 * x * x * x : 1 - Math.pow(-2 * x + 2, 3) / 2);
+  const easeOut = (x) => 1 - Math.pow(1 - x, 3);
+  const easeOutQuint = (x) => 1 - Math.pow(1 - x, 5); // 柱子生长：起步快、收尾很柔
+  const easeOutBack = (x) => 1 + 2.2 * Math.pow(x - 1, 3) + 1.2 * Math.pow(x - 1, 2); // 略冲过头再回弹（徽章弹出）
+  const lerp = (a, b, x) => a + (b - a) * x;
+  const smoothstep = (a, b, x) => { const k = clamp((x - a) / (b - a)); return k * k * (3 - 2 * k); };
+
+  // ---------- 渲染器：按设备像素比渲染（系统用 2 倍超采样再缩小，边缘自然抗锯齿，所以关掉 MSAA 省时间） ----------
+  const renderer = new THREE.WebGLRenderer({ antialias: false, alpha: true, preserveDrawingBuffer: true });
+  renderer.setPixelRatio(DPR);
+  renderer.setSize(W, H);
+  renderer.setClearColor(0x000000, 0);              // 透明，露出 CSS 渐变背景
+  renderer.toneMapping = THREE.ACESFilmicToneMapping;
+  renderer.toneMappingExposure = 1.0;
+  document.body.prepend(renderer.domElement);
+  const scene = new THREE.Scene();
+  window.__three = { renderer, scene };                          // 让系统统计三角形数和贴图数
+  // 灯光写在柱子的着色器里（见下方 lacquerMat）：主光 + 轮廓光 + 顶部柔光箱 + 天光/地光。
+  // 这样不用 PMREM 环境贴图和 MeshStandard/Physical：软件渲染下每帧省一半时间，准备阶段省 1~4 秒。
+  const KEY_DIR = new THREE.Vector3(-4, 9, 7).normalize();   // 主光：左前上方，暖白
+  const RIM_DIR = new THREE.Vector3(5, 4, -7).normalize();   // 轮廓光：右后方，冷蓝，勾出柱子边
+
+  // ---------- 布局：竖版柱子更紧凑，横版更舒展 ----------
+  const n = DATA.length;
+  const GAP = portrait ? 1.3 : 1.55;                // 相邻柱中心距
+  const BAR_W = GAP * 0.6, BAR_D = BAR_W, R = BAR_W * 0.16; // 柱宽/深、圆角半径
+  const MAXH = portrait ? 10 : 5.6;                 // 满刻度对应的世界高度（竖版更高，填满竖向空间）
+  const x0 = -((n - 1) * GAP) / 2;
+  const KEY = HIGHLIGHT === -1 ? DATA.reduce((m, d, i) => (d[1] > DATA[m][1] ? i : m), 0) : HIGHLIGHT;
+  const backZ = -(BAR_D / 2 + 0.3);                 // 背板刻度线所在的 z（离柱子近一点，相机右移时刻度数字不会钻到第一根柱子后面）
+
+  // ---------- 相机取景（先算好：文字贴图按画面上的实际像素大小生成，才清晰） ----------
+  const camera = new THREE.PerspectiveCamera(30, W / H, 0.1, 100);
+  const center = new THREE.Vector3(portrait ? -0.1 : 0.15, MAXH * 0.45, 0);
+  // 画面整体平移给标题留位：横版往右、往下；竖版往下（占画面宽/高的比例）
+  const SHIFT_X = portrait ? 0 : 0.135, SHIFT_Y = portrait ? 0.125 : 0.055;
+  camera.setViewOffset(W, H, -W * SHIFT_X, -H * SHIFT_Y, W, H);
+  // 取景：左（含刻度数字）右上（含数值标签）下（含类目名）四边都要放得下（平移后一边宽一边窄），取最远的距离
+  const vHalf = THREE.MathUtils.degToRad(camera.fov) / 2, hHalf = Math.atan(Math.tan(vHalf) * camera.aspect);
+  const tV = Math.tan(vHalf), tH = Math.tan(hHalf);
+  const extL = (n * GAP) / 2 + 1.8 + center.x, extR = (n * GAP) / 2 + 0.8 - center.x, extT = MAXH * 0.55 + (portrait ? 1.4 : 1.9), extB = MAXH * 0.45 + (portrait ? 1.4 : 1.6);
+  const baseDist = Math.max(extL / (tH * (1 + 2 * SHIFT_X)), extR / (tH * (1 - 2 * SHIFT_X)), extT / (tV * (1 + 2 * SHIFT_Y)), extB / (tV * (1 - 2 * SHIFT_Y))) + BAR_D;
+  const PPU = (H * DPR) / (2 * Math.tan(vHalf) * baseDist * 0.97) * 1.1; // 柱子所在平面上，每个世界单位≈多少设备像素
+
+  // ---------- 程序生成的贴图（画布） ----------
+  // 横向两端淡出的线（刻度线用）
+  const lineTex = new THREE.CanvasTexture((() => {
+    const c = document.createElement('canvas'); c.width = 256; c.height = 4; const g = c.getContext('2d');
+    const gr = g.createLinearGradient(0, 0, 256, 0);
+    gr.addColorStop(0, 'rgba(255,255,255,0)'); gr.addColorStop(0.12, 'rgba(255,255,255,1)'); gr.addColorStop(0.88, 'rgba(255,255,255,1)'); gr.addColorStop(1, 'rgba(255,255,255,0)');
+    g.fillStyle = gr; g.fillRect(0, 0, 256, 4); return c;
+  })());
+  // 柔光圆斑（柱顶光晕）
+  const glowTex = new THREE.CanvasTexture((() => {
+    const c = document.createElement('canvas'); c.width = c.height = 64; const g = c.getContext('2d');
+    const gr = g.createRadialGradient(32, 32, 0, 32, 32, 32);
+    gr.addColorStop(0, 'rgba(255,255,255,1)'); gr.addColorStop(0.35, 'rgba(255,255,255,0.35)'); gr.addColorStop(1, 'rgba(255,255,255,0)');
+    g.fillStyle = gr; g.fillRect(0, 0, 64, 64); return c;
+  })());
+
+  // ---------- 地台：三张着色器平面（软件渲染下着色器里的 if 不省时间，所以按区域拆开，各自只画自己那块像素）
+  //   1) 大地台：深色半透明镜面 + 抗锯齿网格，边缘淡出；2) 柱子那一排的窄条：接触阴影 + 前沿亮边；
+  //   3) 重点柱脚下的小方块：光池 + 常亮光环 + 一次扩散环（叠加发光，只在高亮时画） ----------
+  const accent = new THREE.Color(ACCENT), cLow = new THREE.Color(COLOR_LOW), cHigh = new THREE.Color(COLOR_HIGH);
+  const VS_WORLD = `varying vec3 vP; void main(){ vec4 w = modelMatrix * vec4(position,1.0); vP = w.xyz; gl_Position = projectionMatrix * viewMatrix * w; }`;
+  const flat = (mesh, y, order) => { mesh.rotation.x = -Math.PI / 2; mesh.position.y = y; mesh.renderOrder = order; scene.add(mesh); return mesh; };
+  const floorMat = new THREE.ShaderMaterial({
+    transparent: true, depthWrite: false,
+    uniforms: {
+      uBase: { value: new THREE.Color('#0d1830') }, uGrid: { value: new THREE.Color('#3b5d9e') }, uSpot: { value: new THREE.Color('#1d3566') },
+      uCell: { value: GAP }, uOff: { value: new THREE.Vector2(x0 - GAP / 2, -GAP / 2) },
+      uSize: { value: new THREE.Vector2((n * GAP) / 2 + 2.2, 4.2) },
+    },
+    vertexShader: VS_WORLD,
+    fragmentShader: `
+      uniform vec3 uBase, uGrid, uSpot; uniform float uCell; uniform vec2 uOff, uSize; varying vec3 vP;
+      void main(){
+        vec2 p = vP.xz;
+        float r = length(p / uSize);
+        float fade = 1.0 - smoothstep(0.55, 1.0, r);           // 边缘淡出
+        vec2 q = (p - uOff) / uCell;
+        vec2 gd = abs(fract(q - 0.5) - 0.5) / max(fwidth(q), 1e-4);
+        float line = 1.0 - min(min(gd.x, gd.y), 1.0);          // 1 像素宽、抗锯齿
+        vec3 col = mix(uBase, uSpot, exp(-r * r * 3.0));       // 中心略亮
+        col = mix(col, uGrid, line * 0.55);
+        gl_FragColor = vec4(col, (0.74 + line * 0.2) * fade);   // 半透明：下面的倒影透上来
+        #include <tonemapping_fragment>
+        #include <colorspace_fragment>
+      }`,
+  });
+  const fs = floorMat.uniforms.uSize.value;         // 椭圆片刚好盖住淡出范围（比方形少画两成像素）
+  flat(new THREE.Mesh(new THREE.CircleGeometry(1.01, 48), floorMat), 0, 1).scale.set(fs.x, fs.y, 1);
+
+  const EDGE_Z = BAR_D / 2 + 0.18, STRIP_D = EDGE_Z + 0.06; // 前沿亮边的 z；窄条覆盖到亮边为止
+  const contactMat = new THREE.ShaderMaterial({
+    transparent: true, depthWrite: false, premultipliedAlpha: true,
+    defines: { NB: n },
+    uniforms: {
+      uX0: { value: x0 }, uCell: { value: GAP }, uBar: { value: new THREE.Vector2(BAR_W / 2, BAR_D / 2) },
+      uAO: { value: 0 },                                    // 前几根柱的接触阴影已出现（柱子按顺序长出，阴影跟着出现）
+      uEdge: { value: new THREE.Vector2(EDGE_Z, (n * GAP) / 2 + 0.3) },  // 前沿亮边：z 位置、半长
+      uEdgeCol: { value: new THREE.Color('#6f96e6').convertLinearToSRGB() },
+    },
+    vertexShader: VS_WORLD,
+    fragmentShader: `
+      uniform float uX0, uCell, uAO; uniform vec2 uBar, uEdge; uniform vec3 uEdgeCol; varying vec3 vP;
+      void main(){
+        vec2 p = vP.xz;
+        // 接触阴影：只看最近的那根柱，柱底轮廓外两个方向各自柔和淡出（相乘 = 圆角的软阴影）
+        float i = clamp(floor((p.x - uX0) / uCell + 0.5), 0.0, float(NB - 1));
+        vec2 dd = smoothstep(vec2(-0.04), vec2(0.32), abs(p - vec2(uX0 + i * uCell, 0.0)) - uBar);
+        float sh = clamp(uAO - i, 0.0, 1.0) * (1.0 - dd.x) * (1.0 - dd.y) * 0.9;
+        // 前沿亮边（舞台感），两端淡出
+        float ez = (1.0 - smoothstep(0.008, 0.02, abs(p.y - uEdge.x))) * smoothstep(uEdge.y, uEdge.y * 0.75, abs(p.x)) * 0.85;
+        gl_FragColor = vec4(uEdgeCol * ez, max(sh, ez));       // 预乘透明度：阴影 = 压黑，亮边 = 盖上颜色
+      }`,
+  });
+  flat(new THREE.Mesh(new THREE.PlaneGeometry(n * GAP + 0.8, 2 * STRIP_D), contactMat), 0.003, 3);
+
+  const KEY_R = Math.max(GAP, BAR_W * 2.1) + 0.2;    // 地面光的范围（半径）
+  const keyGlowMat = new THREE.ShaderMaterial({
+    transparent: true, depthWrite: false,
+    blending: THREE.CustomBlending, blendSrc: THREE.OneFactor, blendDst: THREE.OneFactor, // 纯叠加发光
+    uniforms: { uAccent: { value: accent }, uCell: { value: GAP }, uRing: { value: BAR_W }, uKey: { value: new THREE.Vector4(0, 0, 1, 0) } }, // uKey：x、光池/光环强度、扩散环半径、扩散环强度
+    vertexShader: VS_WORLD,
+    fragmentShader: `
+      uniform vec3 uAccent; uniform float uCell, uRing; uniform vec4 uKey; varying vec3 vP;
+      float ring(float d, float r, float w){ float x = (d - r) / w; return exp(-x * x); }
+      void main(){
+        float kd = length(vP.xz - vec2(uKey.x, 0.0)), kx = kd / uCell;
+        float pool = kx < 0.35 ? mix(1.0, 0.35, kx / 0.35) : max(0.0, 0.35 * (1.0 - (kx - 0.35) / 0.65));
+        vec3 g = uAccent * (uKey.y * (0.5 * pool + 0.9 * ring(kd, uRing * mix(0.85, 1.0, uKey.y), 0.055)) + uKey.w * ring(kd, uKey.z, 0.045));
+        g = sqrt(g / (1.0 + g));                               // 简易压缩 + 转到屏幕亮度（不过曝）
+        gl_FragColor = vec4(g, max(g.r, max(g.g, g.b)));
+      }`,
+  });
+  const keyGlow = flat(new THREE.Mesh(new THREE.PlaneGeometry(2 * KEY_R, 2 * KEY_R), keyGlowMat), 0.006, 4);
+
+  // ---------- 文字贴图：按画面实际像素大小生成画布（1:1，不糊），深色描边保证压在网格线上也清楚 ----------
+  function textSprite(text, { color = '#9fb2d6', weight = 700, h = 0.4 } = {}) {
+    const c = document.createElement('canvas'), g = c.getContext('2d');
+    const ch = Math.max(16, Math.ceil(h * PPU)), px = ch / 1.45, font = `${weight} ${px}px "Noto Sans CJK SC"`;
+    g.font = font; c.width = Math.ceil(g.measureText(text).width + px * 0.5); c.height = ch;
+    g.font = font; g.textAlign = 'center'; g.textBaseline = 'middle'; g.lineJoin = 'round';
+    g.lineWidth = px * 0.16; g.strokeStyle = 'rgba(4,8,20,0.75)'; g.strokeText(text, c.width / 2, c.height / 2);
+    g.fillStyle = color; g.fillText(text, c.width / 2, c.height / 2);
+    const tex = new THREE.CanvasTexture(c); tex.colorSpace = THREE.SRGBColorSpace; tex.generateMipmaps = false; tex.minFilter = THREE.LinearFilter;
+    const s = new THREE.Sprite(new THREE.SpriteMaterial({ map: tex, transparent: true, depthTest: false, depthWrite: false }));
+    s.scale.set((h * c.width) / c.height, h, 1); s.renderOrder = 6;
+    return s;
+  }
+
+  // ---------- 背板刻度线 + 刻度数字 ----------
+  const ticks = [];
+  if (TICK > 0) for (let v = TICK; v <= MAXV; v += TICK) {
+    const y = (v / MAXV) * MAXH;
+    const ln = new THREE.Mesh(new THREE.PlaneGeometry(n * GAP + 0.8, 0.02), new THREE.MeshBasicMaterial({ map: lineTex, color: '#4a6aa8', transparent: true, opacity: 0, depthWrite: false }));
+    ln.position.set(-0.15, y, backZ); scene.add(ln);
+    const lb = textSprite(fmt(v), { color: '#8ea3cc', weight: 700, h: portrait ? 0.5 : 0.42 });
+    lb.material.depthTest = true; lb.renderOrder = 2;   // 刻度数字在背板上，允许被前面的柱子挡住
+    lb.center.set(1, 0.5); lb.position.set(x0 - BAR_W / 2 - 0.9, y, backZ); scene.add(lb);
+    ticks.push({ ln, lb, y });
+  }
+
+  // ---------- 柱子：圆角柱，生长时只拉长中段（圆角不变形）；颜色用顶点色做上亮下暗的渐变 ----------
+  const H0 = 2 * R + 0.02;                          // 几何体初始高度：上下两段圆角
+  const tmpC = new THREE.Color(), tmpTop = new THREE.Color(), tmpBot = new THREE.Color();
+  // 圆角盒子（自己生成）：只在圆角处加分段，平面就是一整块，三角形只有通用圆角盒的三分之一（软件渲染按三角形数计费）。
+  // SEG = 每个面上一段圆角的分段数（整段 90° 圆角 = 2×SEG 段）
+  function roundedBox(w, h, d, r, SEG = 2) {
+    const half = [w / 2, h / 2, d / 2], inner = half.map((v) => v - r);
+    const coords = (a) => {                         // 一条轴上的格点：两端是圆角分段，中间一整段
+      const arc = Array.from({ length: SEG - 1 }, (_, k) => inner[a] + r * Math.tan((Math.PI / 4) * (k + 1) / SEG));
+      return [-half[a], ...arc.map((v) => -v).reverse(), -inner[a], inner[a], ...arc, half[a]];
+    };
+    const pos = [], nrm = [], idx = [], p = new THREE.Vector3(), c = new THREE.Vector3(), lo = new THREE.Vector3(...inner).negate(), hi = new THREE.Vector3(...inner);
+    for (const [ax, u0, v0] of [[0, 1, 2], [1, 2, 0], [2, 0, 1]]) for (const sg of [1, -1]) {
+      const [u, v] = sg > 0 ? [u0, v0] : [v0, u0], cu = coords(u), cv = coords(v), base = pos.length / 3;
+      for (const a of cu) for (const b of cv) {
+        p.setComponent(ax, sg * half[ax]).setComponent(u, a).setComponent(v, b);
+        c.copy(p).clamp(lo, hi); p.sub(c).normalize();   // 投到圆角面上：内盒最近点 + 半径 × 方向
+        nrm.push(p.x, p.y, p.z); pos.push(c.x + p.x * r, c.y + p.y * r, c.z + p.z * r);
+      }
+      for (let i = 0; i < cu.length - 1; i++) for (let j = 0; j < cv.length - 1; j++) {
+        const q = base + i * cv.length + j, q2 = q + cv.length;
+        idx.push(q, q2, q2 + 1, q, q2 + 1, q + 1);
+      }
+    }
+    const geo = new THREE.BufferGeometry();
+    geo.setAttribute('position', new THREE.Float32BufferAttribute(pos, 3)); geo.setAttribute('normal', new THREE.Float32BufferAttribute(nrm, 3)); geo.setIndex(idx);
+    return geo;
+  }
+  function makeBarGeo() {
+    const geo = roundedBox(BAR_W, H0, BAR_D, R).translate(0, H0 / 2, 0);
+    const pos = geo.attributes.position, nrm = geo.attributes.normal;
+    geo.userData.y0 = Float32Array.from({ length: pos.count }, (_, i) => pos.getY(i));
+    geo.userData.ny = Float32Array.from({ length: nrm.count }, (_, i) => nrm.getY(i));
+    geo.setAttribute('color', new THREE.BufferAttribute(new Float32Array(pos.count * 3), 3));
+    pos.setUsage(THREE.DynamicDrawUsage); geo.attributes.color.setUsage(THREE.DynamicDrawUsage);
+    return geo;
+  }
+  // 把柱子拉到高度 h，并按 top/bot 两个颜色刷渐变（柱顶面再提亮一点）
+  function shapeBar(geo, h, top, bot) {
+    const pos = geo.attributes.position, col = geo.attributes.color, y0 = geo.userData.y0, ny = geo.userData.ny;
+    const stretch = Math.max(0, h - H0), mid = H0 / 2;
+    for (let i = 0; i < pos.count; i++) {
+      const y = y0[i] > mid ? y0[i] + stretch : y0[i];
+      pos.setY(i, y);
+      const k = Math.pow(clamp(y / Math.max(h, H0)), 0.8);
+      tmpC.copy(bot).lerp(top, k);
+      if (ny[i] > 0.7) tmpC.multiplyScalar(1.12);
+      col.setXYZ(i, tmpC.r, tmpC.g, tmpC.b);
+    }
+    pos.needsUpdate = true; col.needsUpdate = true;
+  }
+  // 高亮“扫色”：柱子 y < uFill 的部分换成高亮色渐变（金色从柱底扫到柱顶），扫描线上带一道亮边。
+  // 蓝和金直接混色中途会发灰发粉，扫色就没有这个问题。柱子和倒影共用这段着色器代码。
+  const hiTop = accent.clone(), hiBot = accent.clone().multiplyScalar(0.3);
+  const wipeUniforms = () => ({ uFill: { value: -1 }, uBarH: { value: 1 }, uHiTop: { value: hiTop }, uHiBot: { value: hiBot } });
+  const WIPE_GLSL = `uniform float uFill, uBarH; uniform vec3 uHiTop, uHiBot;
+    vec3 wipe(vec3 c, float y){ float k = clamp(y / uBarH, 0.0, 1.0); vec3 hi = mix(uHiBot, uHiTop, k * (2.0 - k * 0.8) / 1.2); return mix(c, hi, 1.0 - smoothstep(uFill - 0.03, uFill + 0.03, y)); }`;
+  // 倒影材质：在世界坐标 y<0 越往下越透明（倒影是把柱子几何体上下翻转再画一遍）
+  function reflectMat() {
+    const m = new THREE.MeshBasicMaterial({ vertexColors: true, transparent: true, opacity: 0.6, depthWrite: false }); // 不受光，省时间
+    m.userData.u = wipeUniforms();
+    m.onBeforeCompile = (s) => {
+      Object.assign(s.uniforms, m.userData.u);
+      s.vertexShader = s.vertexShader.replace('#include <common>', '#include <common>\nvarying float vWY;')
+        .replace('#include <project_vertex>', '#include <project_vertex>\nvWY = (modelMatrix * vec4(transformed, 1.0)).y;');
+      s.fragmentShader = s.fragmentShader.replace('#include <common>', '#include <common>\nvarying float vWY;\n' + WIPE_GLSL)
+        .replace('#include <color_fragment>', '#include <color_fragment>\ndiffuseColor.rgb = wipe(diffuseColor.rgb, -vWY);')
+        .replace('#include <dithering_fragment>', '#include <dithering_fragment>\ngl_FragColor.a *= exp(vWY * 0.75);');
+    };
+    return m;
+  }
+  // 亮面烤漆材质（自写着色器）：漫反射 = 顶点色 × (天光/地光 + 主光 + 轮廓光)，
+  // 高光 = 反射方向去“看”一个解析的摄影棚（顶部柔光箱、两条竖灯条、主光点、冷色轮廓光、地面压暗），再乘菲涅尔。
+  // 想更亮/更哑光：调 uSpec（反射强度）和 uGloss（主光高光锐度）
+  function lacquerMat() {
+    return new THREE.ShaderMaterial({
+      vertexColors: true,
+      uniforms: {
+        uKey: { value: KEY_DIR }, uRim: { value: RIM_DIR },
+        uKeyCol: { value: new THREE.Color('#fff0dc').multiplyScalar(1.15) }, uRimCol: { value: new THREE.Color('#6f9dff').multiplyScalar(1.2) },
+        uSky: { value: new THREE.Color('#9fbaff').multiplyScalar(0.42) }, uGround: { value: new THREE.Color('#0b1224').multiplyScalar(0.6) },
+        uSpec: { value: 1.0 }, uGloss: { value: 90 }, uGlow: { value: 0 }, uBand: { value: 0 },
+        ...wipeUniforms(),
+      },
+      vertexShader: `
+        varying vec3 vN, vW, vC;
+        void main(){ vec4 w = modelMatrix * vec4(position,1.0); vW = w.xyz; vN = normalize(mat3(modelMatrix) * normal); vC = color; gl_Position = projectionMatrix * viewMatrix * w; }`,
+      fragmentShader: `
+        uniform vec3 uKey, uRim, uKeyCol, uRimCol, uSky, uGround; uniform float uSpec, uGloss, uGlow, uBand;
+        varying vec3 vN, vW, vC;
+        ${WIPE_GLSL}
+        vec3 studio(vec3 r){                                   // 反射方向看到的摄影棚
+          vec3 c = mix(vec3(0.012,0.02,0.045), vec3(0.09,0.12,0.2), smoothstep(-0.25, 0.15, r.y)); // 地面暗 → 地平线
+          c += vec3(1.25) * smoothstep(0.62, 0.8, r.y);                                             // 顶部柔光箱
+          float strip = smoothstep(0.1, 0.0, abs(r.y - 0.25) - 0.28);
+          vec2 h = r.xz * inversesqrt(max(dot(r.xz, r.xz), 1e-6));                                // 水平方向
+          c += vec3(1.1,1.0,0.92) * strip * smoothstep(0.86, 0.95, dot(h, vec2(-0.7507, 0.6606)));  // 左前竖灯条
+          c += vec3(0.55,0.7,1.0) * strip * smoothstep(0.9, 0.97, dot(h, vec2(0.8, -0.6)));         // 右后竖灯条（冷）
+          return c;
+        }
+        void main(){
+          vec3 n = normalize(vN), v = normalize(cameraPosition - vW), r = reflect(-v, n);
+          float nv = max(dot(n, v), 0.0);
+          vec3 diff = mix(uGround, uSky, n.y * 0.5 + 0.5)
+                    + uKeyCol * (max(dot(n, uKey), 0.0) * 0.8 + 0.2 * (dot(n, uKey) * 0.5 + 0.5))
+                    + uRimCol * max(dot(n, uRim), 0.0) * 0.5;
+          float f1 = 1.0 - nv, f2 = f1 * f1, fres = 0.05 + 0.95 * f2 * f2 * f1;   // 菲涅尔（Schlick）
+          float rr = max(dot(r, uRim), 0.0), rr2 = rr * rr, rr4 = rr2 * rr2;
+          vec3 spec = studio(r) * mix(0.18, 1.0, fres)
+                    + uKeyCol * exp(uGloss * (dot(r, uKey) - 1.0)) * 1.6         // 主光高光点（≈ pow(cos, uGloss)，更省）
+                    + uRimCol * (rr4 * rr4 * rr4) * 0.6;
+          float topK = n.y > 0.7 ? 1.12 : 1.0;                               // 顶面略亮（和顶点色一致）
+          vec3 albedo = wipe(vC / topK, vW.y) * topK;
+          float band = exp(-pow((vW.y - uFill) / 0.1, 2.0)) * uBand;          // 扫描线亮边
+          vec3 col = albedo * diff + spec * uSpec + albedo * uGlow + vec3(1.0, 0.86, 0.6) * band;
+          gl_FragColor = vec4(col, 1.0);
+          #include <tonemapping_fragment>
+          #include <colorspace_fragment>
+        }`,
+    });
+  }
+  const bars = DATA.map(([name, v], i) => {
+    const x = x0 + i * GAP;
+    const geo = makeBarGeo();
+    const bar = new THREE.Mesh(geo, lacquerMat()); bar.position.x = x; bar.frustumCulled = false; scene.add(bar);
+    const refl = new THREE.Mesh(geo, reflectMat()); refl.position.x = x; refl.scale.y = -1; refl.frustumCulled = false; refl.renderOrder = 0; scene.add(refl);
+    const base = cLow.clone().lerp(cHigh, clamp(v / MAXV));
+    const label = textSprite(name, { color: '#d3ddf2', weight: 700, h: portrait ? 0.6 : 0.52 });
+    label.center.set(0.5, 1); label.position.set(x, 0, BAR_D / 2 + 0.34); scene.add(label);
+    const val = valueSprite(v); scene.add(val);
+    return { bar, refl, label, val, v, x, base, geo };
+  });
+
+  // 数值标签：每帧按需重画画布（数字滚动；数值或高亮程度不变就不重画）。画布按最终数值的宽度和画面像素定尺寸
+  const badgeTop = new THREE.Color(ACCENT).lerp(new THREE.Color('#ffffff'), 0.35).getStyle(); // 徽章渐变上端 = 高亮色提亮
+  function valueSprite(vmax) {
+    const sh = portrait ? 0.8 : 0.72;                 // 标签高度（世界单位）
+    const c = document.createElement('canvas'), g = c.getContext('2d');
+    const k = (sh * PPU) / 150;                       // 下面按高 150 的坐标画，再缩到实际像素
+    g.font = '900 92px "Noto Sans CJK SC"';
+    const cw = Math.ceil(g.measureText(fmt(vmax)).width + 96);
+    c.width = Math.ceil(cw * k); c.height = Math.ceil(150 * k);
+    const tex = new THREE.CanvasTexture(c); tex.colorSpace = THREE.SRGBColorSpace; tex.generateMipmaps = false; tex.minFilter = THREE.LinearFilter;
+    const s = new THREE.Sprite(new THREE.SpriteMaterial({ map: tex, transparent: true, depthTest: false, depthWrite: false }));
+    s.scale.set((sh * cw) / 150, sh, 1); s.center.set(0.5, 0); s.renderOrder = 7;
+    let last = '';
+    const txtCol = new THREE.Color(), darkCol = new THREE.Color('#1a1206');
+    s.userData.draw = (v, hi) => {
+      const txt = fmt(v), keyStr = txt + '|' + hi.toFixed(2);
+      if (keyStr === last) return; last = keyStr;
+      g.setTransform(k, 0, 0, k, 0, 0); g.clearRect(0, 0, cw, 150);
+      g.font = '900 92px "Noto Sans CJK SC"'; g.textAlign = 'center'; g.textBaseline = 'middle'; g.lineJoin = 'round';
+      if (hi > 0.03) {                               // 高亮：金色胶囊徽章（带一圈亮边），很快变实心再弹到原大，不出现半透明的脏色
+        const tw = g.measureText(txt).width + 56, ph = 118, s2 = lerp(0.55, 1, easeOutBack(hi));
+        g.save(); g.translate(cw / 2, 78); g.scale(s2, s2); g.globalAlpha = clamp(hi * 12);
+        g.beginPath(); g.roundRect(-tw / 2, -ph / 2, tw, ph, ph / 2);
+        const gr = g.createLinearGradient(0, -ph / 2, 0, ph / 2); gr.addColorStop(0, badgeTop); gr.addColorStop(1, ACCENT);
+        g.fillStyle = gr; g.fill(); g.lineWidth = 5; g.strokeStyle = 'rgba(255,240,200,0.9)'; g.stroke();
+        g.restore();
+      }
+      const solid = clamp((hi - 0.02) / 0.08);        // 徽章一出现就是实心的，字同时变深，不糊
+      if (solid < 1) { g.globalAlpha = 1 - solid; g.lineWidth = 11; g.strokeStyle = 'rgba(4,8,20,0.6)'; g.strokeText(txt, cw / 2, 80); g.globalAlpha = 1; }
+      txtCol.set('#ffffff').lerp(darkCol, solid);
+      g.fillStyle = '#' + txtCol.getHexString(); g.fillText(txt, cw / 2, 80);
+      tex.needsUpdate = true;
+    };
+    return s;
+  }
+
+  // ---------- 高亮：柱顶光晕（地面光池/光环见上面的 keyGlow） ----------
+  const halo = new THREE.Sprite(new THREE.SpriteMaterial({ map: glowTex, color: accent, transparent: true, opacity: 0, depthWrite: false, blending: THREE.AdditiveBlending }));
+  halo.scale.set(BAR_W * 3.2, BAR_W * 2.2, 1); halo.renderOrder = 4; scene.add(halo);
+  halo.visible = keyGlow.visible = false;
+  const hudTitle = document.getElementById('title'), hudSub = document.getElementById('sub');
+  const cu = contactMat.uniforms, ku = keyGlowMat.uniforms;
+  // 刻度数字避让标题：每帧把刻度数字投影到屏幕，离标题/副标题文字太近就淡出（标题改长了也不会压字）
+  const hudRects = [hudTitle, hudSub].map((el) => { const rg = document.createRange(); rg.selectNodeContents(el); const r = rg.getBoundingClientRect(), iy = r.height * 0.16; return { left: r.left, right: r.right, top: r.top + iy, bottom: r.bottom - iy }; }); // 行框上下收一点 ≈ 字形范围
+  const pA = new THREE.Vector3(), pB = new THREE.Vector3(), camRight = new THREE.Vector3(), camUp = new THREE.Vector3();
+  const toPx = (v) => [(v.x + 1) * W / 2, (1 - v.y) * H / 2];
+  function hudClear(sprite) {                       // 返回 0..1：0 = 压到标题上
+    pA.copy(sprite.position).project(camera);
+    pB.copy(sprite.position).addScaledVector(camRight, sprite.scale.x).addScaledVector(camUp, sprite.scale.y).project(camera);
+    const [ax, ay] = toPx(pA), [bx, by] = toPx(pB), w = bx - ax, h = ay - by;
+    const box = { l: ax - w * sprite.center.x + w * 0.07, r: ax + w * (1 - sprite.center.x) - w * 0.07, t: ay - h * (1 - sprite.center.y) + h * 0.2, b: ay + h * sprite.center.y - h * 0.2 }; // 去掉贴图留白
+    let gap = 1e9;
+    for (const rc of hudRects) gap = Math.min(gap, Math.max(rc.left - box.r, box.l - rc.right, rc.top - box.b, box.t - rc.bottom));
+    return smoothstep(0, 8, gap);
+  }
+
+  draw = (t) => {
+    const hk = KEY == null ? 0 : easeInOut(seg(t, HIGHLIGHT_AT, HIGHLIGHT_AT + HIGHLIGHT_LEN));  // 扫色进度
+    const hb = KEY == null ? 0 : easeOut(seg(t, HIGHLIGHT_AT + HIGHLIGHT_LEN * 0.7, HIGHLIGHT_AT + HIGHLIGHT_LEN + 0.35)); // 徽章出现
+    cu.uAO.value = 0;
+    bars.forEach((b, i) => {
+      const k = easeOutQuint(seg(t, GROW_AT + i * GROW_STAGGER, GROW_AT + i * GROW_STAGGER + GROW_LEN));
+      const h = Math.max(0.002, (b.v / MAXV) * MAXH * k);
+      const isKey = i === KEY;
+      // 颜色：普通柱高亮时略压暗；重点柱靠着色器扫色变成高亮色
+      tmpTop.copy(b.base);
+      if (!isKey) tmpTop.multiplyScalar(lerp(1, 0.62, hk));
+      tmpBot.copy(tmpTop).multiplyScalar(0.28);
+      const gh = Math.max(h, H0);
+      cu.uAO.value += clamp(h * 3);
+      b.bar.visible = b.refl.visible = k > 0;     // 还没开始长的柱子先不显示
+      b.bar.scale.y = b.refl.scale.y = h < H0 ? h / H0 : 1; b.refl.scale.y *= -1;
+      const sig = gh.toFixed(4) + '|' + (isKey ? 0 : hk).toFixed(4);  // 长完、变色完就不再改顶点（省每帧上传）
+      if (sig !== b.sig) { shapeBar(b.geo, gh, tmpTop, tmpBot); b.sig = sig; }
+      b.val.position.set(b.x, h + 0.12, 0);
+      b.val.material.opacity = seg(t, GROW_AT + i * GROW_STAGGER, GROW_AT + i * GROW_STAGGER + 0.3) * (isKey ? 1 : lerp(1, 0.8, hk));
+      b.val.userData.draw(b.v * k, isKey ? hb : 0);
+      b.label.material.opacity = easeOut(seg(t, 0.2 + i * 0.08, 0.8 + i * 0.08)) * (isKey ? 1 : lerp(1, 0.75, hk));
+      if (isKey) {                                // 高亮特效跟着重点柱走
+        const u = b.bar.material.uniforms, ru = b.refl.material.userData.u;
+        u.uFill.value = ru.uFill.value = hk >= 1 ? 1e3 : hk > 0 ? lerp(-0.15, gh + 0.15, hk) : -1;
+        u.uBarH.value = ru.uBarH.value = gh;
+        u.uBand.value = 1.6 * Math.sin(Math.PI * hk);
+        u.uGlow.value = 0.12 * hk + 0.3 * Math.sin(Math.PI * seg(t, HIGHLIGHT_AT + HIGHLIGHT_LEN * 0.8, HIGHLIGHT_AT + HIGHLIGHT_LEN + 0.5)); // 扫到顶时整根闪一下
+        const pp = seg(t, HIGHLIGHT_AT + HIGHLIGHT_LEN * 0.6, HIGHLIGHT_AT + HIGHLIGHT_LEN + 1.2);
+        ku.uKey.value.set(b.x, hb, BAR_W * lerp(1, 2.1, easeOut(pp)), 0.7 * Math.sin(Math.PI * pp));
+        keyGlow.position.x = b.x; keyGlow.visible = hb + ku.uKey.value.w > 0.004;
+        halo.position.set(b.x, h + 0.05, -0.05); halo.material.opacity = 0.3 * hb; halo.visible = hb > 0.01;
+      }
+    });
+    // 相机：低机位正面 → 3/4 俯视，慢慢推近
+    const p = easeInOut(seg(t, 0, DURATION));
+    const az = portrait ? lerp(-0.04, 0.28, p) : lerp(-0.08, 0.32, p), el = lerp(0.1, 0.36, p), dist = baseDist * lerp(1.06, 0.97, p);
+    camera.position.set(center.x + dist * Math.cos(el) * Math.sin(az), center.y + dist * Math.sin(el), center.z + dist * Math.cos(el) * Math.cos(az));
+    camera.lookAt(center); camera.updateMatrixWorld();
+    camRight.setFromMatrixColumn(camera.matrixWorld, 0); camUp.setFromMatrixColumn(camera.matrixWorld, 1);
+    ticks.forEach((tk, i) => { const a = easeOut(seg(t, 0.15 + i * 0.1, 0.9 + i * 0.1)); tk.ln.material.opacity = 0.34 * a; tk.lb.material.opacity = 0.9 * a * hudClear(tk.lb); });
+    const a = easeOut(seg(t, 0.1, 0.9));
+    hudTitle.style.opacity = a; hudTitle.style.transform = `translateY(${(1 - a) * 3}vmin)`;
+    hudSub.style.opacity = easeOut(seg(t, 0.5, 1.3));
+    renderer.render(scene, camera);
+  };
+  draw(DURATION);                                   // 先摆到最后一帧（全部可见、高亮打开），保证编译到所有着色器
+  await renderer.compileAsync(scene, camera);       // 编译全部着色器
+  draw(0);                                          // 预热一帧：上传贴图
+})();
+window.renderFrame = async (t) => { await window.sceneReady; draw(t); };
+</script>
+</body>
+</html>

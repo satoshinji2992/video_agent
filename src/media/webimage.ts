@@ -43,8 +43,10 @@ export function isPublicIp(ip: string): boolean {
     const s = ip.toLowerCase();
     const mapped = /^::ffff:(\d+\.\d+\.\d+\.\d+)$/.exec(s) ?? /^64:ff9b::(\d+\.\d+\.\d+\.\d+)$/.exec(s);
     if (mapped) return isPublicIp(mapped[1]!);
-    if (s === '::' || s === '::1') return false;
+    // A first group of 0 is never public: ::, ::1, IPv4-compatible ::a.b.c.d / ::7f00:1 and the rest of ::/16
+    // (the IPv4-mapped ::ffff: form is judged by its IPv4 address above).
     const first = parseInt(s.split(':')[0] || '0', 16);
+    if (first === 0) return false;
     // Unique local fc00::/7, link-local fe80::/10, multicast ff00::/8, documentation 2001:db8::/32.
     if ((first & 0xfe00) === 0xfc00 || (first & 0xffc0) === 0xfe80 || (first & 0xff00) === 0xff00) return false;
     if (/^2001:0?db8:/.test(s)) return false;

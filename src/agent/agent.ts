@@ -144,8 +144,17 @@ export function cleanBubble(text: string, userText: string) {
       const latin = part.match(/[A-Za-z][A-Za-z'’-]*/g) ?? [];
       if ((latin.length && !cjk) || (latin.length >= 3 && cjk / (cjk + latin.join('').length) < 0.25)) { drop++; words += latin.length; } else break;
     }
-    if (drop && words >= 5) {
+    if (drop && words >= 10) {
       const rest = parts.slice(drop).join('').trim();
+      t = (rest.match(/[㐀-鿿]/g) ?? []).length >= 6 ? rest : '';
+    }
+    // Notes that start in Chinese ("民宿名 (input), 平台 (…). Length? Max 3 questions. … 风格.大理民宿的片子…"): the
+    // message proper starts right after the last Latin full stop glued to a Chinese character, which Chinese
+    // writing never has (it ends sentences with 。).
+    // A dozen Latin words before it: brand and model names in a real message stay well below that.
+    const glued = [...t.matchAll(/[.?!](?=[㐀-鿿])/g)].at(-1);
+    if (glued && (t.slice(0, glued.index).match(/[A-Za-z][A-Za-z'’-]*/g) ?? []).length >= 12) {
+      const rest = t.slice(glued.index! + glued[0].length).trim();
       t = (rest.match(/[㐀-鿿]/g) ?? []).length >= 6 ? rest : '';
     }
   }

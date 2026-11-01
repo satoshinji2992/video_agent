@@ -283,7 +283,7 @@ export function planTools(ctx: Ctx, voiceover: Voiceover) {
     'ask_user',
     'Show a question card the user answers with a tap (or by typing). Two shapes: one question with 2-4 short options, to confirm a script ("按这版出片" / "改成更紧迫的钩子" / ...) or, after a video, to offer next steps (mode "suggest"); or a brief card: `questions`, up to 3 short questions about the brief (platform and shape, length, tone, voiceover, what to feature), each with 2-4 options and the recommended one first; the user picks per question or taps "就按推荐来", and one message comes back like "平台：抖音竖版；时长：30 秒左右". It returns at once: after calling it, end your turn and wait for the reply. Never list the options in your own text.',
     {
-      question: z.string().describe('The card\'s question, or for a brief card a short heading ("先确认几件事").'),
+      question: z.string().describe('The card\'s question, or for a brief card a short heading about this particular video in your own words, e.g. a question or the name of the video; no stock formula such as 先定这几样 or 先确认几件事.'),
       options: z.array(z.string().max(40)).min(2).max(4).optional().describe('One question\'s options (not with questions).'),
       recommended_index: z.number().int().min(0).max(3).optional(),
       questions: z.array(z.object({
